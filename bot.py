@@ -3148,13 +3148,6 @@ def wallex_decimal(value):
         return Decimal("0")
 
 
-def wallex_format_amount(value):
-    rendered = format(value.normalize(), "f")
-    if "." in rendered:
-        rendered = rendered.rstrip("0").rstrip(".")
-    return rendered or "0"
-
-
 def wallex_get(path, authenticated=True):
     api_key = os.getenv("WALLEX_API_KEY", "").strip()
     if authenticated and not api_key:
