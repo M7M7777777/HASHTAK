@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import gzip
 import html as html_lib
 import io
@@ -27,7 +28,7 @@ from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, Ca
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.3"
+VERSION = "3.3.4"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -273,7 +274,7 @@ async def save_widget_index(context):
     bot_data = context.application.bot_data
     index = bot_data.get("widget_index") or empty_widget_index()
     raw = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    packed = gzip.compress(raw, compresslevel=9)
+    packed = gzip.compress(raw, compresslevel=6)
     archived = await context.bot.send_document(
         chat_id=ACCESS_CHANNEL_ID,
         document=InputFile(io.BytesIO(packed), filename="widget-index.json.gz"),
@@ -295,7 +296,7 @@ async def record_widget_message(context, token, chat_id, message_id, entry=None)
     lock = bot_data.setdefault("widget_index_lock", asyncio.Lock())
     async with lock:
         previous_index = bot_data.get("widget_index")
-        index = json.loads(json.dumps(previous_index or empty_widget_index()))
+        index = copy.deepcopy(previous_index or empty_widget_index())
         if entry is not None:
             index["widgets"][token] = entry
         index["messages"][f"{chat_id}:{message_id}"] = token
