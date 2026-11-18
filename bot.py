@@ -140,10 +140,6 @@ def load_access_users():
 def save_access_users(users):
     atomic_write_json(ACCESS_STORE, sorted(users))
 
-def access_storage_text(users, ai_config_message_id=None):
-    payload = {"users": sorted(users), "ai_config_message_id": ai_config_message_id}
-    return ACCESS_STORAGE_MARKER + "\n" + json.dumps(payload, ensure_ascii=False)
-
 AI_CONFIG_MARKER = "TELEGRAM_JOURNAL_AI_CONFIG_V1"
 
 def ai_keys():
@@ -210,13 +206,6 @@ def validate_storage_payload(data):
     if data.get("widget_index_file_id") is not None and not isinstance(data.get("widget_index_file_id"), str):
         raise ValueError("شناسه آرشیو ویجت معتبر نیست")
     return data
-
-def plain_storage_text(payload):
-    validate_storage_payload(payload)
-    result = PLAIN_STORAGE_MARKER + "\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    if len(result) > 4096:
-        raise ValueError("اطلاعات ذخیره سازی از ظرفیت یک پیام تلگرام بیشتر شده")
-    return result
 
 def parse_plain_storage(message_text):
     lines = (message_text or "").splitlines()
