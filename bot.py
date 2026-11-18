@@ -449,9 +449,14 @@ async def create_numbered_topic(application, chat_id):
     key = str(chat_id)
     state = states.setdefault(key, {"next_number": 1, "active": False})
     number = state["next_number"]
-    await application.bot.create_forum_topic(
+    topic = await application.bot.create_forum_topic(
         chat_id=chat_id,
         name=f"تاپیک شماره ({number:04d})",
+    )
+    await application.bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=topic.message_thread_id,
+        text=f"📅 تاریخ شمسی و ساعت ساخت\n{persian_timestamp()}",
     )
     state["next_number"] = number + 1
     save_topic_loop_states(states)
