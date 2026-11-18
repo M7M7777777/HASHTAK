@@ -28,7 +28,7 @@ from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, Ca
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.4"
+VERSION = "3.3.5"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -41,6 +41,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SOURCE_STORE = os.path.join(DATA_DIR, "sources.json")
 ACCESS_STORE = os.getenv("ACCESS_STORE", os.path.join(DATA_DIR, "access.json"))
 USER_STATE_STORE = os.path.join(DATA_DIR, "user-data.pickle")
+TOPIC_LOOP_STORE = os.path.join(DATA_DIR, "topic-loops.json")
 LEGACY_SOURCE_STORE = os.path.join(BASE_DIR, "sources.json")
 LEGACY_ACCESS_STORE = os.path.join(BASE_DIR, "access.json")
 
@@ -421,6 +422,144 @@ async def initialize_access_storage(application):
         startup_error = f"{type(error).__name__}: {error}"
         application.bot_data["access_storage_error"] = startup_error
         print(f"CRITICAL: persistent channel storage unavailable; refusing to overwrite stored data: {startup_error}", flush=True)
+    await resume_topic_loops(application)
+
+
+def load_topic_loop_states():
+    data = load_json_store(TOPIC_LOOP_STORE, {})
+    if not isinstance(data, dict):
+        raise RuntimeError("ساختار ذخیره وضعیت ساخت تاپیک ها معتبر نیست")
+    states = {}
+    for chat_id, state in data.items():
+        if not str(chat_id).lstrip("-").isdigit() or not isinstance(state, dict):
+            continue
+        next_number = state.get("next_number", 1)
+        active = state.get("active", False)
+        if isinstance(next_number, int) and next_number > 0 and isinstance(active, bool):
+            states[str(int(chat_id))] = {"next_number": next_number, "active": active}
+    return states
+
+
+def save_topic_loop_states(states):
+    atomic_write_json(TOPIC_LOOP_STORE, states)
+
+
+async def create_numbered_topic(application, chat_id):
+    states = application.bot_data["topic_loop_states"]
+    key = str(chat_id)
+    state = states.setdefault(key, {"next_number": 1, "active": False})
+    number = state["next_number"]
+    await application.bot.create_forum_topic(
+        chat_id=chat_id,
+        name=f"تاپیک شماره ({number:04d})",
+    )
+    state["next_number"] = number + 1
+    save_topic_loop_states(states)
+
+
+async def topic_loop_worker(application, chat_id):
+    key = str(chat_id)
+    while application.bot_data["topic_loop_states"].get(key, {}).get("active"):
+        await asyncio.sleep(60)
+        if not application.bot_data["topic_loop_states"].get(key, {}).get("active"):
+            break
+        try:
+            await create_numbered_topic(application, chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                f"TOPIC LOOP ERROR chat_id={chat_id}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+
+
+async def resume_topic_loops(application):
+    try:
+        states = load_topic_loop_states()
+    except Exception as error:
+        print(
+            f"WARNING: topic loop state could not be loaded: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        states = {}
+    application.bot_data["topic_loop_states"] = states
+    application.bot_data["topic_loop_tasks"] = {}
+    for key, state in states.items():
+        if state.get("active"):
+            task = application.create_task(
+                topic_loop_worker(application, int(key)),
+                name=f"topic-loop-{key}",
+            )
+            application.bot_data["topic_loop_tasks"][key] = task
+
+
+async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    command = (message.text or "").strip()
+
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text("این دستور فقط داخل گروه قابل استفاده است.")
+        raise ApplicationHandlerStop
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await message.reply_text("⛔ فقط مدیران گروه می توانند از این دستور استفاده کنند.")
+            raise ApplicationHandlerStop
+
+        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        if bot_member.status != "administrator" or not getattr(bot_member, "can_manage_topics", False):
+            await message.reply_text("⚠️ ربات باید مدیر گروه باشد و دسترسی مدیریت تاپیک ها را داشته باشد.")
+            raise ApplicationHandlerStop
+
+        chat_info = await context.bot.get_chat(chat.id)
+        if not getattr(chat_info, "is_forum", False):
+            await message.reply_text("⚠️ قابلیت Topics یا انجمن باید در گروه فعال باشد.")
+            raise ApplicationHandlerStop
+
+        states = context.application.bot_data.setdefault("topic_loop_states", {})
+        tasks = context.application.bot_data.setdefault("topic_loop_tasks", {})
+        key = str(chat.id)
+
+        if command == "شرووع":
+            if states.get(key, {}).get("active"):
+                await message.reply_text("ساخت تاپیک ها از قبل فعاله.")
+                raise ApplicationHandlerStop
+            if key not in states:
+                states[key] = {"next_number": 1, "active": False}
+            states[key]["active"] = True
+            save_topic_loop_states(states)
+            try:
+                await create_numbered_topic(context.application, chat.id)
+            except Exception:
+                states[key]["active"] = False
+                save_topic_loop_states(states)
+                raise
+            task = context.application.create_task(
+                topic_loop_worker(context.application, chat.id),
+                name=f"topic-loop-{key}",
+            )
+            tasks[key] = task
+            await message.reply_text("✅ ساخت تاپیک ها شروع شد. هر ۱ دقیقه یک تاپیک جدید ساخته میشه.")
+        else:
+            state = states.get(key)
+            if not state or not state.get("active"):
+                await message.reply_text("ساخت تاپیک ها فعلا متوقفه.")
+                raise ApplicationHandlerStop
+            state["active"] = False
+            save_topic_loop_states(states)
+            task = tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+            await message.reply_text("⏹ ساخت تاپیک ها متوقف شد.")
+    except ApplicationHandlerStop:
+        raise
+    except Exception as error:
+        await message.reply_text(f"⚠️ اجرای دستور ناموفق بود: {type(error).__name__}: {error}")
+    raise ApplicationHandlerStop
 
 
 
@@ -5555,6 +5694,7 @@ app.add_handler(MessageHandler(
     filters.VOICE | filters.Document.ALL,
     media_router,
 ))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*(شرووع|توقف)\s*$"), topic_loop_command), group=0)
 app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*م\s*$"), widget_menu_start), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, widget_text), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text), group=1)
