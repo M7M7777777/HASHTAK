@@ -109,8 +109,9 @@ def load_json_store(path, default):
     if errors:
         raise RuntimeError("ذخیره سازی JSON خراب است و نسخه پشتیبان قابل خواندن نیست: " + "; ".join(errors))
     return default
-ACCESS_CHANNEL_ID = -1003734187598
-WIDGET_ARCHIVE_GROUP_ID = -1003916791291
+ACCESS_CHANNEL_ID = int(os.getenv("TELEGRAM_JOURNAL_STORAGE_GROUP_ID", "-1004301287348"))
+LEGACY_ACCESS_CHANNEL_ID = -1003734187598
+WIDGET_ARCHIVE_GROUP_ID = ACCESS_CHANNEL_ID
 ACCESS_STORAGE_MARKER = "TELEGRAM_JOURNAL_ACCESS_V1"
 # Owner ID is fixed in the source so no hosting variable is needed.
 OWNER_ID = 1881579954
@@ -232,7 +233,7 @@ def storage_message_text(context, users=None, ai_config=None):
         "ai_config": bot_data.get("ai_config", {"services": {}, "default_service": None}) if ai_config is None else ai_config,
         "widget_index_file_id": bot_data.get("widget_index_file_id"),
     }
-    return encrypt_marked_payload(data)
+    return plain_storage_text(data)
 
 async def persist_storage(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
@@ -316,6 +317,18 @@ async def initialize_access_storage(application):
         ai_config = {"services": {}, "default_service": None}
         widget_index_file_id = None
         legacy_decryption_failed = False
+        source_chat_id = ACCESS_CHANNEL_ID
+
+        # If the new group has no storage record yet, read the old pinned record
+        # once and migrate its contents without encryption.
+        if not pinned:
+            try:
+                legacy_chat = await application.bot.get_chat(LEGACY_ACCESS_CHANNEL_ID)
+                if legacy_chat.pinned_message:
+                    pinned = legacy_chat.pinned_message
+                    source_chat_id = LEGACY_ACCESS_CHANNEL_ID
+            except Exception as legacy_error:
+                print(f"Legacy storage lookup skipped: {type(legacy_error).__name__}: {legacy_error}", flush=True)
 
         if pinned:
             pinned_text = pinned.text or pinned.caption or ""
@@ -326,14 +339,16 @@ async def initialize_access_storage(application):
                 users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
                 ai_config = saved["ai_config"]
                 widget_index_file_id = saved.get("widget_index_file_id")
-                application.bot_data["storage_message_id"] = pinned.message_id
+                if source_chat_id == ACCESS_CHANNEL_ID:
+                    application.bot_data["storage_message_id"] = pinned.message_id
             elif first_line == STORAGE_V2_MARKER:
                 try:
                     saved = decrypt_marked_payload(pinned_text)
                     users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
                     ai_config = saved["ai_config"]
                     widget_index_file_id = saved.get("widget_index_file_id")
-                    application.bot_data["storage_message_id"] = pinned.message_id
+                    if source_chat_id == ACCESS_CHANNEL_ID:
+                        application.bot_data["storage_message_id"] = pinned.message_id
                 except Exception as migration_error:
                     # Keep the old encrypted message untouched as a backup.
                     # Start a new plain record; local access.json can restore user IDs.
@@ -351,7 +366,8 @@ async def initialize_access_storage(application):
                     users = {int(value) for value in old_payload.get("users", []) if str(value).isdigit() and int(value) > 0}
                 elif isinstance(old_payload, list):
                     users = {int(value) for value in old_payload if str(value).isdigit() and int(value) > 0}
-                application.bot_data["storage_message_id"] = pinned.message_id
+                if source_chat_id == ACCESS_CHANNEL_ID:
+                    application.bot_data["storage_message_id"] = pinned.message_id
             else:
                 print("Pinned channel message is not the bot storage record; creating a new plain record.", flush=True)
 
@@ -362,10 +378,10 @@ async def initialize_access_storage(application):
             "ai_config": ai_config,
             "widget_index_file_id": widget_index_file_id,
         }
-        if not application.bot_data.get("storage_message_id"):
+        if not application.bot_data.get("storage_message_id") or source_chat_id != ACCESS_CHANNEL_ID:
             message = await application.bot.send_message(
                 chat_id=ACCESS_CHANNEL_ID,
-                text=encrypt_marked_payload(payload),
+                text=plain_storage_text(payload),
                 disable_notification=True,
             )
             await application.bot.pin_chat_message(
@@ -376,9 +392,8 @@ async def initialize_access_storage(application):
             application.bot_data["storage_message_id"] = message.message_id
         else:
             # Avoid Telegram's "message is not modified" error on clean restarts.
-            desired_storage_text = encrypt_marked_payload(payload)
+            desired_storage_text = plain_storage_text(payload)
             if pinned_text != desired_storage_text:
-                # Successful legacy reads are migrated in place to plain JSON.
                 await application.bot.edit_message_text(
                     chat_id=ACCESS_CHANNEL_ID,
                     message_id=application.bot_data["storage_message_id"],
