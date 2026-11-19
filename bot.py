@@ -694,7 +694,7 @@ async def resume_topic_loops(application):
     # Keep the forum topic sequence continuous after a Railway redeploy.
     storage_group_key = "-1004301287348"
     storage_group_state = states.setdefault(
-        storage_group_key, {"next_number": 1096, "active": False}
+        storage_group_key, {"next_number": 1096, "active": True}
     )
     storage_group_state["next_number"] = max(
         int(storage_group_state.get("next_number", 1096)), 1096
