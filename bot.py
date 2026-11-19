@@ -862,6 +862,19 @@ def apply_runtime_snapshot(application, snapshot, raw_for_hash=None):
     ):
         raise ValueError("بخش های نسخه پشتیبان معتبر نیستند")
     application.bot_data["source_texts"] = sources
+    # The mounted Railway volume is the write-through journal for topic state.
+    # A cloud Rich Message snapshot can lag behind a just-written pending marker
+    # or next_number. Prefer each locally persisted chat state when restoring.
+    local_loops = application.bot_data.get("topic_loop_states")
+    if isinstance(local_loops, dict) and local_loops:
+        merged_loops = dict(loops)
+        merged_loops.update(local_loops)
+        loops = merged_loops
+        print(
+            f"TOPIC STATE RESTORE: local journal took precedence for "
+            f"{len(local_loops)} chat(s)",
+            flush=True,
+        )
     application.bot_data["topic_loop_states"] = loops
     if authorized_users is not None:
         application.bot_data["authorized_users"] = {
