@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "11"
+VERSION = "12"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -705,6 +705,10 @@ async def persist_storage(context, users=None, ai_config=None):
 
 
 async def persist_ai_config(config, context):
+    if not await ensure_access_storage_ready(context.application):
+        startup_error = context.application.bot_data.get("access_storage_error")
+        detail = f"\nعلت اولیه: {startup_error}" if startup_error else ""
+        raise RuntimeError("ذخیره سازی کانال آماده نیست؛ اطلاعات قبلی دست نخورده باقی ماند." + detail)
     bot_data = context.application.bot_data
     previous_ai_config = copy.deepcopy(bot_data.get("ai_config"))
     bot_data["ai_config"] = config
@@ -938,7 +942,7 @@ async def runtime_snapshot_worker(application):
 
 async def initialize_access_storage(application):
     try:
-        chat = await application.bot.get_chat(ACCESS_CHANNEL_ID)
+        chat = await telegram_storage_call(application.bot.get_chat, ACCESS_CHANNEL_ID)
         pinned = chat.pinned_message
         needs_widget_copy = False
         pinned_text = ""
@@ -953,7 +957,7 @@ async def initialize_access_storage(application):
         legacy_decryption_failed = False
         rich_saved = None
         if pinned:
-            raw_chat = await api_async("getChat", {"chat_id": ACCESS_CHANNEL_ID})
+            raw_chat = await telegram_storage_call(api_async, "getChat", {"chat_id": ACCESS_CHANNEL_ID})
             raw_pinned = raw_chat.get("pinned_message") if isinstance(raw_chat, dict) else None
             rich_saved = extract_rich_storage_payload(raw_pinned)
             pinned_text = pinned.text or pinned.caption or ""
@@ -1018,7 +1022,7 @@ async def initialize_access_storage(application):
         if not application.bot_data.get("storage_message_id"):
             needs_widget_copy = True
             try:
-                old_chat = await application.bot.get_chat(LEGACY_ACCESS_CHANNEL_ID)
+                old_chat = await telegram_storage_call(application.bot.get_chat, LEGACY_ACCESS_CHANNEL_ID)
                 old_pinned = old_chat.pinned_message
                 if old_pinned:
                     old_text = old_pinned.text or old_pinned.caption or ""
@@ -1099,12 +1103,14 @@ async def initialize_access_storage(application):
         desired_text = plain_storage_text(payload)
         storage_message_id = application.bot_data.get("storage_message_id")
         if not storage_message_id:
-            message = await application.bot.send_message(
+            message = await telegram_storage_call(
+                application.bot.send_message,
                 chat_id=ACCESS_CHANNEL_ID,
                 text=desired_text,
                 disable_notification=True,
             )
-            await application.bot.pin_chat_message(
+            await telegram_storage_call(
+                application.bot.pin_chat_message,
                 chat_id=ACCESS_CHANNEL_ID,
                 message_id=message.message_id,
                 disable_notification=True,
@@ -1177,6 +1183,34 @@ async def initialize_access_storage(application):
             f"and refusing to overwrite stored data: {startup_error}",
             flush=True,
         )
+        if not application.bot_data.get("access_storage_retry_scheduled"):
+            application.bot_data["access_storage_retry_scheduled"] = True
+            application.create_task(
+                access_storage_retry_worker(application),
+                name="telegram-access-storage-retry",
+            )
+
+
+async def access_storage_retry_worker(application):
+    try:
+        while not application.bot_data.get("access_channel_ready"):
+            await asyncio.sleep(15)
+            if application.bot_data.get("access_channel_ready"):
+                break
+            await initialize_access_storage(application)
+    finally:
+        application.bot_data["access_storage_retry_scheduled"] = False
+
+
+async def ensure_access_storage_ready(application):
+    if application.bot_data.get("access_channel_ready"):
+        return True
+    lock = application.bot_data.setdefault("access_init_lock", asyncio.Lock())
+    async with lock:
+        if application.bot_data.get("access_channel_ready"):
+            return True
+        await initialize_access_storage(application)
+        return bool(application.bot_data.get("access_channel_ready"))
 
 
 def load_topic_loop_states():
@@ -1714,7 +1748,7 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def persist_access_users(users, context):
-    if not context.application.bot_data.get("access_channel_ready"):
+    if not await ensure_access_storage_ready(context.application):
         startup_error = context.application.bot_data.get("access_storage_error")
         detail = f"\nعلت اولیه: {startup_error}" if startup_error else ""
         raise RuntimeError("ذخیره سازی کانال آماده نیست؛ اطلاعات قبلی دست نخورده باقی ماند." + detail)
@@ -2698,7 +2732,7 @@ def is_authorized(context, user):
         return False
     return is_owner(user) or user.id in context.bot_data.get("authorized_users", set())
 
-def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
     message_text = message.text or message.caption or "" if message else ""
