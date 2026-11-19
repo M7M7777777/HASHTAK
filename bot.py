@@ -29,7 +29,7 @@ from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.9"
+VERSION = "3.3.10"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -219,6 +219,8 @@ def validate_storage_payload(data):
             raise ValueError(f"شناسه فایل ذخیره سازی {key} معتبر نیست")
     if "topics" in data and not isinstance(data.get("topics"), dict):
         raise ValueError("فهرست تاپیک های ذخیره سازی معتبر نیست")
+    if "storage_readable_message_ids" in data and not isinstance(data.get("storage_readable_message_ids"), dict):
+        raise ValueError("شناسه پیام های خوانای ذخیره سازی معتبر نیست")
     return data
 
 def plain_storage_text(payload):
@@ -243,9 +245,225 @@ def storage_message_text(context, users=None, ai_config=None):
         "runtime_snapshot_file_id": bot_data.get("runtime_snapshot_file_id"),
         "runtime_snapshot_sha256": bot_data.get("runtime_snapshot_sha256"),
         "topics": bot_data.get("storage_topics", {}),
+        "storage_readable_message_ids": bot_data.get("storage_readable_message_ids", {}),
     }
     return plain_storage_text(data)
 
+
+
+
+def _storage_text_value(value, limit=240):
+    if value is None:
+        return "تنظیم نشده"
+    if isinstance(value, (dict, list)):
+        rendered = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    else:
+        rendered = str(value)
+    rendered = rendered.strip() or "خالی"
+    if len(rendered) > limit:
+        rendered = rendered[:limit] + "…"
+    return rendered
+
+
+def readable_storage_texts(application):
+    bot_data = application.bot_data
+    users = sorted(bot_data.get("authorized_users", set()))
+    user_data = application.user_data
+    ai_config = bot_data.get("ai_config") or ai_default_config()
+    services = ai_config.get("services", {}) if isinstance(ai_config, dict) else {}
+    sources = bot_data.get("source_texts") or {}
+    loops = bot_data.get("topic_loop_states") or {}
+    user_audit_topics = bot_data.get("user_audit_topics") or {}
+    widget_index = bot_data.get("widget_index") or empty_widget_index()
+    widgets = widget_index.get("widgets", {}) if isinstance(widget_index, dict) else {}
+    widget_messages = widget_index.get("messages", {}) if isinstance(widget_index, dict) else {}
+    connectors = ai_config.get("connectors", {}) if isinstance(ai_config, dict) else {}
+
+    settings_lines = [
+        "⚙️ تنظیمات ربات",
+        f"وضعیت ذخیره سازی: {'فعال' if bot_data.get('access_channel_ready') else 'در انتظار اتصال'}",
+        f"سرویس پیش فرض: {services.get(ai_config.get('default_service'), {}).get('name', 'انتخاب نشده') if isinstance(services, dict) else 'انتخاب نشده'}",
+        f"تعداد سرویس های هوش مصنوعی: {len(services) if isinstance(services, dict) else 0}",
+    ]
+    if isinstance(services, dict):
+        for service_id, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            settings_lines.extend([
+                "",
+                f"سرویس: {service.get('name') or service_id}",
+                f"مدل: {_storage_text_value(service.get('model'))}",
+                f"آدرس API: {_storage_text_value(service.get('url'))}",
+                f"کلید API: {_storage_text_value(service.get('api_key'), 700)}",
+                f"هدرها: {_storage_text_value(service.get('headers') or {}, 900)}",
+                f"پیش فرض: {'بله' if ai_config.get('default_service') == service_id else 'خیر'}",
+            ])
+    if isinstance(connectors, dict):
+        settings_lines.append("")
+        settings_lines.append(f"تعداد اتصال های جانبی: {len(connectors)}")
+        for connector_id, connector in connectors.items():
+            if not isinstance(connector, dict):
+                continue
+            settings_lines.extend([
+                f"اتصال: {connector.get('name') or connector_id}",
+                f"نوع: {_storage_text_value(connector.get('type'))}",
+                f"آدرس: {_storage_text_value(connector.get('url'))}",
+                f"وضعیت: {'فعال' if connector.get('enabled') else 'غیرفعال'}",
+            ])
+            for secret_name in ("api_key", "token", "secret", "headers"):
+                if connector.get(secret_name):
+                    settings_lines.append(f"{secret_name}: {_storage_text_value(connector.get(secret_name), 700)}")
+
+    users_lines = [
+        "👥 کاربران",
+        f"تعداد کاربران مجاز: {len(users)}",
+        f"تعداد کاربرانی که اطلاعات ذخیره شده دارند: {len(user_data)}",
+        f"مدیر اصلی: {OWNER_ID}",
+    ]
+    if users:
+        users_lines.append("")
+        users_lines.append("شناسه کاربران مجاز:")
+        users_lines.extend(str(user_id) for user_id in users[:100])
+        if len(users) > 100:
+            users_lines.append(f"و {len(users) - 100} کاربر دیگر")
+    if user_data:
+        users_lines.append("")
+        users_lines.append("اطلاعات نشست کاربران:")
+        for user_id, data in list(user_data.items())[:40]:
+            if isinstance(data, dict):
+                keys = "، ".join(str(key) for key in list(data.keys())[:12]) or "بدون مورد"
+                users_lines.append(f"کاربر {user_id}: {keys}")
+            else:
+                users_lines.append(f"کاربر {user_id}: اطلاعات ثبت شده")
+
+    sources_lines = [
+        "📚 منابع ذخیره شده",
+        f"تعداد منابع: {len(sources) if isinstance(sources, dict) else 0}",
+    ]
+    if isinstance(sources, dict):
+        for source_id, source_text in list(sources.items())[:50]:
+            sources_lines.extend([
+                "",
+                f"شناسه: {source_id}",
+                _storage_text_value(source_text, 220),
+            ])
+        if len(sources) > 50:
+            sources_lines.append(f"و {len(sources) - 50} منبع دیگر")
+
+    loop_lines = ["🔁 حلقه ها و ساخت تاپیک"]
+    if isinstance(loops, dict) and loops:
+        for chat_id, state in loops.items():
+            if not isinstance(state, dict):
+                continue
+            loop_lines.append(
+                f"گروه {chat_id} | شماره بعدی: {state.get('next_number', 1)} | "
+                f"وضعیت: {'فعال' if state.get('active') else 'متوقف'}"
+            )
+    else:
+        loop_lines.append("حلقه ای ثبت نشده")
+
+    counter_lines = [
+        "🔢 شمارنده ها",
+        f"کاربران مجاز: {len(users)}",
+        f"کاربران دارای اطلاعات: {len(user_data)}",
+        f"منابع: {len(sources) if isinstance(sources, dict) else 0}",
+        f"سرویس های هوش مصنوعی: {len(services) if isinstance(services, dict) else 0}",
+        f"اتصال های جانبی: {len(connectors) if isinstance(connectors, dict) else 0}",
+        f"ویجت ها: {len(widgets) if isinstance(widgets, dict) else 0}",
+        f"پیام های ثبت شده در آرشیو ویجت: {len(widget_messages) if isinstance(widget_messages, dict) else 0}",
+        f"تاپیک های اختصاصی کاربران: {len(user_audit_topics)}",
+        f"حلقه های فعال: {sum(1 for item in loops.values() if isinstance(item, dict) and item.get('active')) if isinstance(loops, dict) else 0}",
+    ]
+
+    backup_lines = [
+        "💾 پشتیبان",
+        f"وضعیت نسخه پشتیبان فنی: {'موجود' if bot_data.get('runtime_snapshot_file_id') else 'هنوز ساخته نشده'}",
+        f"شناسه فایل پشتیبان: {bot_data.get('runtime_snapshot_file_id') or 'ثبت نشده'}",
+        f"اثر انگشت نسخه: {(bot_data.get('runtime_snapshot_sha256') or '')[:16] or 'ثبت نشده'}",
+        "نسخه فنی برای بازیابی خودکار استفاده می شود",
+        "اطلاعات اصلی این بخش ها در پیام های خوانا نمایش داده می شود",
+    ]
+
+    widget_lines = [
+        "🧩 آرشیو ویجت ها",
+        f"تعداد ویجت ها: {len(widgets) if isinstance(widgets, dict) else 0}",
+        f"تعداد پیام های آرشیو: {len(widget_messages) if isinstance(widget_messages, dict) else 0}",
+    ]
+    report_lines = [
+        "📊 گزارش ها",
+        f"تعداد تاپیک های اختصاصی کاربران: {len(user_audit_topics)}",
+        "گزارش های جدید هر کاربر در تاپیک اختصاصی خودش ثبت می شود",
+    ]
+
+    sections = {
+        "تنظیمات": settings_lines,
+        "کاربران": users_lines,
+        "منابع": sources_lines,
+        "شمارنده ها": counter_lines,
+        "حلقه ها": loop_lines,
+        "پشتیبان": backup_lines,
+        "آرشیو ویجت ها": widget_lines,
+        "گزارش ها": report_lines,
+    }
+    result = {}
+    for name, lines in sections.items():
+        rendered = "\n".join(lines)
+        if len(rendered) > 3800:
+            rendered = rendered[:3650].rsplit("\n", 1)[0] + "\n… ادامه جزئیات در نسخه پشتیبان فنی"
+        result[name] = rendered
+    return result
+
+
+async def sync_readable_storage_topics(context):
+    bot_data = context.application.bot_data
+    topics = bot_data.get("storage_topics") or {}
+    message_ids = bot_data.setdefault("storage_readable_message_ids", {})
+    sections = readable_storage_texts(context.application)
+    for name, text in sections.items():
+        thread_id = topics.get(name)
+        if not thread_id:
+            continue
+        message_id = message_ids.get(name)
+        if message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_id=message_id,
+                    text=text,
+                    disable_web_page_preview=True,
+                )
+                continue
+            except Exception as error:
+                error_text = str(error).lower()
+                if "message is not modified" in error_text:
+                    continue
+                if not any(marker in error_text for marker in (
+                    "message to edit not found",
+                    "message_id_invalid",
+                    "message can't be edited",
+                    "message can't be found",
+                )):
+                    print(
+                        f"READABLE STORAGE UPDATE FAILED topic={name}: "
+                        f"{type(error).__name__}: {error}",
+                        flush=True,
+                    )
+                    continue
+        try:
+            sent = await context.bot.send_message(
+                chat_id=ACCESS_CHANNEL_ID,
+                message_thread_id=thread_id,
+                text=text,
+                disable_notification=True,
+                disable_web_page_preview=True,
+            )
+            message_ids[name] = sent.message_id
+        except Exception as error:
+            print(
+                f"READABLE STORAGE CREATE FAILED topic={name}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
 
 async def persist_storage(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
@@ -256,6 +474,8 @@ async def persist_storage(context, users=None, ai_config=None):
             raise RuntimeError("پیام اصلی ذخیره سازی گروه پیدا نشد")
         previous_users_file_id = bot_data.get("users_file_id")
         previous_ai_file_id = bot_data.get("ai_config_file_id")
+        previous_authorized_users = bot_data.get("authorized_users")
+        previous_ai_config = bot_data.get("ai_config")
         try:
             if users is not None:
                 users_raw = json.dumps(sorted(users), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -277,15 +497,20 @@ async def persist_storage(context, users=None, ai_config=None):
                     disable_notification=True,
                 )
                 bot_data["ai_config_file_id"] = archived_ai.document.file_id
-            text = storage_message_text(context, users, ai_config)
-            await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
             if users is not None:
                 bot_data["authorized_users"] = set(users)
             if ai_config is not None:
                 bot_data["ai_config"] = ai_config
+            await sync_readable_storage_topics(context)
+            text = storage_message_text(context, users, ai_config)
+            await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
         except Exception:
             bot_data["users_file_id"] = previous_users_file_id
             bot_data["ai_config_file_id"] = previous_ai_file_id
+            if previous_authorized_users is not None:
+                bot_data["authorized_users"] = previous_authorized_users
+            if previous_ai_config is not None:
+                bot_data["ai_config"] = previous_ai_config
             raise
 
 
@@ -515,6 +740,7 @@ async def initialize_access_storage(application):
                 runtime_snapshot_file_id = saved.get("runtime_snapshot_file_id")
                 runtime_snapshot_sha256 = saved.get("runtime_snapshot_sha256")
                 saved_topics = saved.get("topics", {})
+                application.bot_data["storage_readable_message_ids"] = saved.get("storage_readable_message_ids", {})
                 application.bot_data["storage_message_id"] = pinned.message_id
             elif first_line == STORAGE_V2_MARKER:
                 saved = decrypt_marked_payload(pinned_text)
@@ -556,6 +782,7 @@ async def initialize_access_storage(application):
                         ai_config_file_id = old_saved.get("ai_config_file_id")
                         runtime_snapshot_file_id = old_saved.get("runtime_snapshot_file_id")
                         saved_topics = old_saved.get("topics", {})
+                        application.bot_data["storage_readable_message_ids"] = old_saved.get("storage_readable_message_ids", {})
                     elif old_marker == ACCESS_STORAGE_MARKER:
                         old_payload = json.loads("\n".join(old_lines[1:]))
                         raw_users = old_payload.get("users", []) if isinstance(old_payload, dict) else old_payload
@@ -588,6 +815,7 @@ async def initialize_access_storage(application):
         application.bot_data["widget_index_file_id"] = widget_index_file_id
         application.bot_data["runtime_snapshot_file_id"] = runtime_snapshot_file_id
         application.bot_data["runtime_snapshot_sha256"] = runtime_snapshot_sha256
+        application.bot_data.setdefault("storage_readable_message_ids", {})
         application.bot_data["authorized_users"] = users
         application.bot_data["ai_config"] = ai_config
 
