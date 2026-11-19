@@ -499,6 +499,104 @@ async def safe_edit_message_text(bot, **kwargs):
         return None
 
 
+def _rich_storage_digest(payload):
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode_rich_storage_payload(payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    compressed = zlib.compress(raw, 9)
+    encryption_key, authentication_key = ai_keys()
+    nonce = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-NONCE" + compressed, hashlib.sha256).digest()[:16]
+    ciphertext = ai_xor_stream(compressed, encryption_key, nonce)
+    tag = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext, hashlib.sha256).digest()
+    return "HSTK-RICH-1:" + base64.urlsafe_b64encode(nonce + ciphertext + tag).decode("ascii")
+
+
+def decode_rich_storage_payload(encoded):
+    if not isinstance(encoded, str) or not encoded.startswith("HSTK-RICH-1:"):
+        raise ValueError("نشانگر داده پشتیبان Rich Message معتبر نیست")
+    packed = base64.urlsafe_b64decode(encoded.split(":", 1)[1].encode("ascii"))
+    if len(packed) < 48:
+        raise ValueError("داده پشتیبان Rich Message ناقص است")
+    nonce, ciphertext, supplied_tag = packed[:16], packed[16:-32], packed[-32:]
+    encryption_key, authentication_key = ai_keys()
+    expected_tag = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(supplied_tag, expected_tag):
+        raise ValueError("اعتبارسنجی داده پشتیبان Rich Message ناموفق بود")
+    payload = json.loads(zlib.decompress(ai_xor_stream(ciphertext, encryption_key, nonce)).decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("نسخه داده پشتیبان Rich Message معتبر نیست")
+    return payload
+
+
+def extract_rich_storage_payload(message):
+    if not isinstance(message, dict):
+        return None
+    rich = message.get("rich_message")
+    if not isinstance(rich, dict):
+        return None
+    found = []
+
+    def walk(blocks):
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "pre" and isinstance(block.get("text"), str) and block["text"].startswith("HSTK-RICH-1:"):
+                found.append(block["text"])
+            walk(block.get("blocks"))
+
+    walk(rich.get("blocks"))
+    if not found:
+        return None
+    if len(found) != 1:
+        raise ValueError("پیام ذخیره سازی بیش از یک داده پشتیبان دارد")
+    return decode_rich_storage_payload(found[0])
+
+
+def build_rich_storage_message(context):
+    application = context.application
+    bot_data = application.bot_data
+    snapshot = current_runtime_snapshot(application)
+    storage = {
+        "authorized_users": sorted(bot_data.get("authorized_users", set())),
+        "ai_config": bot_data.get("ai_config") or ai_default_config(),
+        "widget_index_file_id": bot_data.get("widget_index_file_id"),
+        "runtime_snapshot_file_id": bot_data.get("runtime_snapshot_file_id"),
+        "runtime_snapshot_sha256": bot_data.get("runtime_snapshot_sha256"),
+        "topics": bot_data.get("storage_topics", {}),
+        "storage_readable_message_ids": bot_data.get("storage_readable_message_ids", {}),
+    }
+    payload = {"version": 1, "storage": storage, "runtime": snapshot}
+    encoded = encode_rich_storage_payload(payload)
+    users = storage["authorized_users"]
+    ai_config = storage["ai_config"]
+    services = ai_config.get("services", {}) if isinstance(ai_config, dict) else {}
+    sources = snapshot.get("sources", {})
+    loops = snapshot.get("topic_loop_states", {})
+    user_data = snapshot.get("user_data", {})
+    audits = snapshot.get("user_audit_topics", {})
+    widgets = (bot_data.get("widget_index") or {}).get("widgets", {})
+    rich_message = {"blocks": [
+        {"type": "heading", "size": 1, "text": "🗄️ مرکز ذخیره سازی HASHTAK"},
+        {"type": "paragraph", "text": "نسخه اصلی و قابل بازیابی اطلاعات ربات · بروزرسانی فقط هنگام تغییر"},
+        {"type": "details", "summary": "👥 کاربران و دسترسی ها", "blocks": [{"type": "paragraph", "text": f"کاربران مجاز: {len(users)}"}]},
+        {"type": "details", "summary": "🤖 تنظیمات هوش مصنوعی", "blocks": [{"type": "paragraph", "text": f"سرویس ها: {len(services)} · پیش فرض: {ai_config.get('default_service') or 'انتخاب نشده'}"}]},
+        {"type": "details", "summary": "📚 منابع و تاپیک ها", "blocks": [{"type": "paragraph", "text": f"منابع: {len(sources)} · حلقه های تاپیک: {len(loops)} · گزارش ها: {len(audits)}"}]},
+        {"type": "details", "summary": "🧩 آرشیو و اطلاعات کاربران", "blocks": [{"type": "paragraph", "text": f"اطلاعات کاربران: {len(user_data)} · ویجت های آرشیو: {len(widgets)}"}]},
+        {"type": "divider"},
+        {"type": "details", "summary": "🔐 داده کامل رمزگذاری شده برای بازیابی خودکار", "blocks": [{"type": "pre", "text": encoded}]},
+        {"type": "footer", "text": f"آخرین بروزرسانی: {persian_timestamp()}"},
+    ], "is_rtl": True}
+    serialized_size = len(json.dumps(rich_message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if serialized_size > MAX_RICH_TEXT_BYTES:
+        raise ValueError(f"حجم نسخه پشتیبان Rich Message از حد مجاز بیشتر شد ({serialized_size} بایت)")
+    return rich_message, payload
+
+
 async def persist_storage(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
     lock = bot_data.setdefault("storage_lock", asyncio.Lock())
@@ -516,13 +614,16 @@ async def persist_storage(context, users=None, ai_config=None):
             if ai_config is not None:
                 bot_data["ai_config"] = ai_config
             await sync_readable_storage_topics(context)
-            text = storage_message_text(context, users, ai_config)
-            await safe_edit_message_text(
-                context.bot,
-                chat_id=ACCESS_CHANNEL_ID,
-                message_id=message_id,
-                text=text,
-            )
+            rich_message, payload = build_rich_storage_message(context)
+            digest = _rich_storage_digest(payload)
+            if digest == bot_data.get("rich_storage_sha256"):
+                return
+            await api_async("editMessageText", {
+                "chat_id": ACCESS_CHANNEL_ID,
+                "message_id": message_id,
+                "rich_message": rich_message,
+            })
+            bot_data["rich_storage_sha256"] = digest
         except Exception:
             bot_data["users_file_id"] = previous_users_file_id
             bot_data["ai_config_file_id"] = previous_ai_file_id
@@ -660,20 +761,7 @@ async def ensure_storage_topics(application, saved_topics=None):
     return topics
 
 
-async def restore_runtime_state(application, file_id):
-    if not file_id:
-        application.bot_data["source_texts"] = {}
-        application.bot_data["topic_loop_states"] = {}
-        application.bot_data["user_audit_topics"] = {}
-        return False
-    remote = await application.bot.get_file(file_id)
-    raw = bytes(await remote.download_as_bytearray())
-    try:
-        snapshot = ast.literal_eval(raw.decode("utf-8"))
-    except (SyntaxError, ValueError, UnicodeDecodeError):
-        # Read backups created by older versions during migration.
-        snapshot = json.loads(raw.decode("utf-8"))
-    application.bot_data["runtime_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
+def apply_runtime_snapshot(application, snapshot, raw_for_hash=None):
     if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
         raise ValueError("ساختار نسخه پشتیبان تلگرام معتبر نیست")
     sources = snapshot.get("sources", {})
@@ -713,6 +801,8 @@ async def restore_runtime_state(application, file_id):
             application.user_data[int(user_id)].update(data)
     save_source_texts(sources)
     save_topic_loop_states(loops)
+    raw = raw_for_hash if raw_for_hash is not None else repr(snapshot).encode("utf-8")
+    application.bot_data["runtime_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
     print(
         f"Telegram runtime snapshot restored: {len(sources)} sources, "
         f"{len(users)} user states, {len(loops)} topic loops",
@@ -721,40 +811,46 @@ async def restore_runtime_state(application, file_id):
     return True
 
 
+async def restore_runtime_state(application, file_id):
+    if not file_id:
+        return False
+    remote = await application.bot.get_file(file_id)
+    raw = bytes(await remote.download_as_bytearray())
+    try:
+        snapshot = ast.literal_eval(raw.decode("utf-8"))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        snapshot = json.loads(raw.decode("utf-8"))
+    return apply_runtime_snapshot(application, snapshot, raw)
+
+
+def current_runtime_snapshot(application):
+    bot_data = application.bot_data
+    return {
+        "version": 1,
+        "sources": bot_data.get("source_texts", {}),
+        "topic_loop_states": bot_data.get("topic_loop_states", {}),
+        "user_audit_topics": bot_data.get("user_audit_topics", {}),
+        "authorized_users": sorted(bot_data.get("authorized_users", set())),
+        "ai_config": bot_data.get("ai_config") or ai_default_config(),
+        "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
+    }
+
+
 async def persist_runtime_state(application):
     bot_data = application.bot_data
     lock = bot_data.setdefault("runtime_storage_lock", asyncio.Lock())
     async with lock:
-        snapshot = {
-            "version": 1,
-            "sources": bot_data.get("source_texts", {}),
-            "topic_loop_states": bot_data.get("topic_loop_states", {}),
-            "user_audit_topics": bot_data.get("user_audit_topics", {}),
-            "authorized_users": sorted(bot_data.get("authorized_users", set())),
-            "ai_config": bot_data.get("ai_config") or ai_default_config(),
-            "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
-        }
+        snapshot = current_runtime_snapshot(application)
         raw = repr(snapshot).encode("utf-8")
         snapshot_hash = hashlib.sha256(raw).hexdigest()
-        if snapshot_hash == bot_data.get("runtime_snapshot_sha256"):
+        if snapshot_hash == bot_data.get("runtime_snapshot_sha256") and bot_data.get("rich_storage_sha256"):
             return
-        thread_id = (bot_data.get("storage_topics") or {}).get("پشتیبان")
-        archived = await telegram_storage_call(application.bot.send_document,
-            chat_id=ACCESS_CHANNEL_ID,
-            message_thread_id=thread_id,
-            document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.txt"),
-            caption="پشتیبان کامل وضعیت ربات · فایل متنی UTF-8",
-            disable_notification=True,
-        )
-        previous_id = bot_data.get("runtime_snapshot_file_id")
         previous_hash = bot_data.get("runtime_snapshot_sha256")
-        bot_data["runtime_snapshot_file_id"] = archived.document.file_id
         bot_data["runtime_snapshot_sha256"] = snapshot_hash
         try:
             context = type("StorageContext", (), {"application": application, "bot": application.bot})()
             await persist_storage(context)
         except Exception:
-            bot_data["runtime_snapshot_file_id"] = previous_id
             bot_data["runtime_snapshot_sha256"] = previous_hash
             raise
 
@@ -785,12 +881,38 @@ async def initialize_access_storage(application):
         ai_config_file_id = None
         saved_topics = {}
         legacy_decryption_failed = False
-
+        rich_saved = None
         if pinned:
+            raw_chat = await api_async("getChat", {"chat_id": ACCESS_CHANNEL_ID})
+            raw_pinned = raw_chat.get("pinned_message") if isinstance(raw_chat, dict) else None
+            rich_saved = extract_rich_storage_payload(raw_pinned)
             pinned_text = pinned.text or pinned.caption or ""
+            if rich_saved:
+                rich_storage = rich_saved.get("storage", {})
+                rich_runtime = rich_saved.get("runtime")
+                if not isinstance(rich_storage, dict) or not isinstance(rich_runtime, dict):
+                    raise ValueError("ساختار داده ذخیره سازی Rich Message معتبر نیست")
+                users = {
+                    int(value) for value in rich_storage.get("authorized_users", rich_runtime.get("authorized_users", []))
+                    if str(value).isdigit() and int(value) > 0
+                }
+                ai_config = rich_storage.get("ai_config", rich_runtime.get("ai_config", ai_config))
+                widget_index_file_id = rich_storage.get("widget_index_file_id")
+                runtime_snapshot_file_id = rich_storage.get("runtime_snapshot_file_id")
+                runtime_snapshot_sha256 = rich_storage.get("runtime_snapshot_sha256")
+                saved_topics = rich_storage.get("topics", {})
+                application.bot_data["storage_readable_message_ids"] = rich_storage.get("storage_readable_message_ids", {})
+                application.bot_data["storage_message_id"] = pinned.message_id
+                application.bot_data["rich_runtime_snapshot"] = rich_runtime
+                application.bot_data["rich_storage_sha256"] = _rich_storage_digest(rich_saved)
+            elif not pinned_text:
+                raise RuntimeError("پیام پین شده متن قابل خواندن ندارد و داده Rich Message هم دریافت نشد؛ برای جلوگیری از بازنویسی اطلاعات، راه اندازی متوقف شد")
+
             lines = pinned_text.splitlines()
             first_line = lines[0].strip() if lines else ""
-            if first_line == PLAIN_STORAGE_MARKER:
+            if rich_saved:
+                pass
+            elif first_line == PLAIN_STORAGE_MARKER:
                 saved = parse_plain_storage(pinned_text)
                 if "users" in saved:
                     users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
@@ -939,15 +1061,14 @@ async def initialize_access_storage(application):
         application.bot_data["access_channel_ready"] = True
         save_access_users(users)
         storage_context = type("StorageContext", (), {"application": application, "bot": application.bot})()
-        if not users_file_id or not ai_config_file_id:
-            await persist_storage(
-                storage_context,
-                users=users if not users_file_id else None,
-                ai_config=ai_config if not ai_config_file_id else None,
-            )
+        # Access users and AI settings are embedded in the Rich Message now.
+        # Restore any legacy runtime file before creating the first Rich Message.
 
         restored = False
-        if runtime_snapshot_file_id:
+        rich_runtime = application.bot_data.pop("rich_runtime_snapshot", None)
+        if rich_runtime is not None:
+            restored = apply_runtime_snapshot(application, rich_runtime)
+        elif runtime_snapshot_file_id:
             restored = await restore_runtime_state(application, runtime_snapshot_file_id)
         if not restored:
             application.bot_data["source_texts"] = load_source_texts()
