@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "14"
+VERSION = "15"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -1309,7 +1309,10 @@ async def create_numbered_topic(application, chat_id):
                 flush=True,
             )
         if chat_id == ACCESS_CHANNEL_ID:
-            await persist_runtime_state(application)
+            try:
+                await persist_runtime_state(application)
+            except Exception as sync_err:
+                print(f"TOPIC LOOP TICK SYNC DEFERRED: {type(sync_err).__name__}: {sync_err}", flush=True)
         return topic.message_thread_id
 
 
@@ -1451,7 +1454,10 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             state["active"] = True
             save_topic_loop_states(states)
-            await persist_runtime_state(context.application)
+            try:
+                await persist_runtime_state(context.application)
+            except Exception as sync_err:
+                print(f"TOPIC LOOP STATE SYNC DEFERRED: {type(sync_err).__name__}: {sync_err}", flush=True)
 
             if not was_active:
                 try:
@@ -1495,7 +1501,10 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     task.cancel()
             state["active"] = True
             save_topic_loop_states(states)
-            await persist_runtime_state(context.application)
+            try:
+                await persist_runtime_state(context.application)
+            except Exception as sync_err:
+                print(f"TOPIC LOOP STATE SYNC DEFERRED: {type(sync_err).__name__}: {sync_err}", flush=True)
             try:
                 await create_numbered_topic(context.application, chat.id)
             except Exception:
@@ -1523,7 +1532,10 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 raise ApplicationHandlerStop
             state["active"] = False
             save_topic_loop_states(states)
-            await persist_runtime_state(context.application)
+            try:
+                await persist_runtime_state(context.application)
+            except Exception as sync_err:
+                print(f"TOPIC LOOP STOP SYNC DEFERRED: {type(sync_err).__name__}: {sync_err}", flush=True)
             task = tasks.pop(key, None)
             if task and not task.done():
                 task.cancel()
@@ -6766,11 +6778,29 @@ app = (
     .token(TOKEN)
     .request(telegram_request)
     .get_updates_request(telegram_updates_request)
-    .post_init(initialize_access_storage)
+    .post_init(start_background_storage_init)
     .build()
 )
-app.bot_data["source_texts"] = {}
-app.bot_data["authorized_users"] = set()
+try:
+    app.bot_data["source_texts"] = load_source_texts()
+except Exception:
+    app.bot_data["source_texts"] = {}
+try:
+    app.bot_data["authorized_users"] = load_access_users()
+except Exception:
+    app.bot_data["authorized_users"] = set()
+try:
+    app.bot_data["topic_loop_states"] = load_topic_loop_states()
+except Exception:
+    app.bot_data["topic_loop_states"] = {}
+
+
+async def start_background_storage_init(application):
+    print("BOT POLLING STARTING; scheduling background Telegram storage sync...", flush=True)
+    application.create_task(
+        initialize_access_storage(application),
+        name="telegram-initial-storage-sync",
+    )
 # Activity auditing is intentionally disabled. No user messages or button clicks
 # are copied into the support/storage group.
 # Group -1 checks every update before the bot's normal handlers.
@@ -6811,6 +6841,31 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 app.add_error_handler(global_error_handler)
 
+def start_health_server():
+    port_raw = os.getenv("PORT", "").strip()
+    if not port_raw.isdigit():
+        return
+    port = int(port_raw)
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"OK v{VERSION}".encode("utf-8"))
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health server listening on 0.0.0.0:{port}", flush=True)
+
+
 if __name__ == "__main__":
+    start_health_server()
     allowed_updates = list(Update.ALL_TYPES) + ["widget_query", "shared_widget_query"]
     app.run_polling(allowed_updates=allowed_updates, bootstrap_retries=-1)
