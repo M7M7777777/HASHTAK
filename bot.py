@@ -6634,4 +6634,4 @@ app.add_error_handler(global_error_handler)
 
 if __name__ == "__main__":
     allowed_updates = list(Update.ALL_TYPES) + ["widget_query", "shared_widget_query"]
-    app.run_polling(allowed_updates=allowed_updates)
+    app.run_polling(allowed_updates=allowed_updates, bootstrap_retries=-1)
