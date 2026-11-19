@@ -447,7 +447,7 @@ async def initialize_access_storage(application):
     try:
         chat = await application.bot.get_chat(ACCESS_CHANNEL_ID)
         pinned = chat.pinned_message
-        needs_widget_copy = not bool(application.bot_data.get("storage_message_id"))
+        needs_widget_copy = False
         pinned_text = ""
         users = set()
         ai_config = {"services": {}, "default_service": None}
@@ -491,6 +491,7 @@ async def initialize_access_storage(application):
 
         # If this is the first run in the new group, import the old pinned settings.
         if not application.bot_data.get("storage_message_id"):
+            needs_widget_copy = True
             try:
                 old_chat = await application.bot.get_chat(LEGACY_ACCESS_CHANNEL_ID)
                 old_pinned = old_chat.pinned_message
