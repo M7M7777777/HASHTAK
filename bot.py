@@ -30,7 +30,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "02"
+VERSION = "03"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -619,7 +619,7 @@ async def ensure_storage_topics(application, saved_topics=None):
         await telegram_storage_call(application.bot.send_message,
             chat_id=ACCESS_CHANNEL_ID,
             message_thread_id=created.message_thread_id,
-            text=f"📁 بخش ذخیره سازی: {name}\nاطلاعات این بخش به صورت متن ساده یا فایل JSON نگهداری می شود.",
+            text=f"📁 بخش ذخیره سازی: {name}\nاطلاعات این بخش به صورت متن نگهداری می شود.",
             disable_notification=True,
         )
     application.bot_data["storage_topics"] = topics
@@ -971,21 +971,50 @@ def save_topic_loop_states(states):
 async def create_numbered_topic(application, chat_id):
     states = application.bot_data["topic_loop_states"]
     key = str(chat_id)
-    state = states.setdefault(key, {"next_number": 1, "active": False})
-    number = state["next_number"]
-    topic = await application.bot.create_forum_topic(
-        chat_id=chat_id,
-        name=f"تاپیک شماره ({number})",
-    )
-    await application.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=topic.message_thread_id,
-        text=persian_timestamp(),
-    )
-    state["next_number"] = number + 1
-    save_topic_loop_states(states)
-    if chat_id == ACCESS_CHANNEL_ID:
-        await persist_runtime_state(application)
+    locks = application.bot_data.setdefault("topic_creation_locks", {})
+    lock = locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        state = states.setdefault(key, {"next_number": 1, "active": False})
+        if state.get("pending_number") is not None:
+            raise RuntimeError(
+                f"نتیجه ساخت تاپیک شماره {state['pending_number']} نامشخص است؛ "
+                "برای جلوگیری از ساخت تکراری، حلقه متوقف شده"
+            )
+        number = int(state.get("next_number", 1))
+        # Persist an in-flight marker before calling Telegram. If the request
+        # times out after Telegram created the topic, a restart won't duplicate it.
+        state["pending_number"] = number
+        save_topic_loop_states(states)
+        try:
+            topic = await application.bot.create_forum_topic(
+                chat_id=chat_id,
+                name=f"تاپیک شماره ({number})",
+            )
+        except Exception:
+            state["active"] = False
+            save_topic_loop_states(states)
+            raise
+
+        # Advance immediately after Telegram confirms topic creation. A later
+        # failure while sending the timestamp must never recreate the same topic.
+        state["next_number"] = number + 1
+        state.pop("pending_number", None)
+        save_topic_loop_states(states)
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=topic.message_thread_id,
+                text=persian_timestamp(),
+            )
+        except Exception as error:
+            print(
+                f"TOPIC INITIAL MESSAGE FAILED chat_id={chat_id} "
+                f"thread_id={topic.message_thread_id}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+        if chat_id == ACCESS_CHANNEL_ID:
+            await persist_runtime_state(application)
+        return topic.message_thread_id
 
 
 async def topic_loop_worker(application, chat_id):
@@ -999,10 +1028,14 @@ async def topic_loop_worker(application, chat_id):
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            state = application.bot_data["topic_loop_states"].get(key, {})
+            state["active"] = False
+            save_topic_loop_states(application.bot_data["topic_loop_states"])
             print(
-                f"TOPIC LOOP ERROR chat_id={chat_id}: {type(error).__name__}: {error}",
+                f"TOPIC LOOP PAUSED chat_id={chat_id}: {type(error).__name__}: {error}",
                 flush=True,
             )
+            break
 
 
 async def resume_topic_loops(application):
@@ -1028,6 +1061,16 @@ async def resume_topic_loops(application):
     storage_group_state["active"] = False
     save_topic_loop_states(states)
 
+    for key, state in states.items():
+        if state.get("pending_number") is not None:
+            state["active"] = False
+            print(
+                f"TOPIC LOOP RECOVERY REQUIRED chat_id={key}: "
+                f"creation of topic {state['pending_number']} may have completed; "
+                "automatic retry was disabled to prevent duplicates",
+                flush=True,
+            )
+    save_topic_loop_states(states)
     application.bot_data["topic_loop_states"] = states
     application.bot_data["topic_loop_tasks"] = {}
     for key, state in states.items():
@@ -1080,8 +1123,15 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if command.startswith("شرووع"):
             state = states.setdefault(key, {"next_number": 1, "active": False})
+            if state.get("pending_number") is not None and requested_number is None:
+                await message.reply_text(
+                    f"⚠️ نتیجه تلاش قبلی برای ساخت تاپیک شماره {state['pending_number']} مشخص نیست. "
+                    "اول گروه رو بررسی کن و بعد شماره بعدی رو با دستور «شرووع عدد» مشخص کن."
+                )
+                raise ApplicationHandlerStop
             if requested_number is not None:
                 state["next_number"] = requested_number
+                state.pop("pending_number", None)
             if state.get("active"):
                 task = tasks.pop(key, None)
                 if task and not task.done():
@@ -2777,23 +2827,32 @@ def button_preview_text(button):
     names = {
         "url": "باز کردن لینک",
         "disabled": "غیرفعال",
+        "web_app": "باز کردن وب اپ",
+        "login_url": "ورود با تلگرام",
+        "copy_text": "کپی متن",
+        "callback_data": "اجرای دستور ربات",
+        "switch_inline_query": "جستجوی درون خطی",
+        "switch_inline_query_current_chat": "جستجو در همین گفتگو",
+        "switch_inline_query_chosen_chat": "انتخاب گفتگو برای جستجو",
     }
     kind = next((key for key in names if key in button), "نامشخص")
     value = ""
     if kind == "url":
-        value = button["url"]
+        value = button.get("url", "")
     elif kind in ("web_app", "login_url"):
-        value = button[kind]["url"]
+        value = (button.get(kind) or {}).get("url", "")
     elif kind == "copy_text":
-        value = button[kind]["text"]
+        value = (button.get(kind) or {}).get("text", "")
+    elif kind == "callback_data":
+        value = button.get("callback_data", "")
     elif kind.startswith("switch_inline_query"):
-        item = button[kind]
-        value = item if isinstance(item, str) else item.get("query", "")
+        item = button.get(kind)
+        value = item if isinstance(item, str) else (item or {}).get("query", "")
     style_names = {"primary": "آبی", "success": "سبز", "danger": "قرمز"}
     return (
         "👀 پیش‌نمایش دکمه\n\n"
-        f"متن دکمه: {button['text']}\n"
-        f"عملکرد: {names[kind]}"
+        f"متن دکمه: {button.get('text', 'بدون عنوان')}\n"
+        f"عملکرد: {names.get(kind, 'نامشخص')}"
         + (f"\nمقدار: {value}" if value else "")
         + f"\nظاهر دکمه: {style_names.get(button.get('style', 'primary'), button.get('style', 'primary'))}"
         + "\n\nاگه درسته ثبتش کن"
@@ -6312,9 +6371,8 @@ app = (
 )
 app.bot_data["source_texts"] = {}
 app.bot_data["authorized_users"] = set()
-# Group -2 records interaction metadata before access checks and handlers.
-app.add_handler(MessageHandler(filters.ALL, audit_log), group=-2)
-app.add_handler(CallbackQueryHandler(audit_log), group=-2)
+# Activity auditing is intentionally disabled. No user messages or button clicks
+# are copied into the support/storage group.
 # Group -1 checks every update before the bot's normal handlers.
 app.add_handler(MessageHandler(filters.ALL, access_guard), group=-1)
 app.add_handler(TypeHandler(Update, widget_query_handler), group=-3)
