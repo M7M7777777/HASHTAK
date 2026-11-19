@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "09"
+VERSION = "10"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -2668,6 +2668,21 @@ def is_authorized(context, user):
     if not user:
         return False
     return is_owner(user) or user.id in context.bot_data.get("authorized_users", set())
+
+def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+    message_text = message.text or message.caption or "" if message else ""
+    print(
+        "INCOMING UPDATE: "
+        f"update_id={update.update_id} "
+        f"user_id={user.id if user else None} "
+        f"chat_type={update.effective_chat.type if update.effective_chat else None} "
+        f"message={bool(message)} "
+        f"text_length={len(message_text)}",
+        flush=True,
+    )
+
 
 async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -6596,6 +6611,7 @@ app.bot_data["authorized_users"] = set()
 # Activity auditing is intentionally disabled. No user messages or button clicks
 # are copied into the support/storage group.
 # Group -1 checks every update before the bot's normal handlers.
+app.add_handler(TypeHandler(Update, log_incoming_update), group=-2)
 app.add_handler(MessageHandler(filters.ALL, access_guard), group=-1)
 app.add_handler(TypeHandler(Update, widget_query_handler), group=-3)
 app.add_handler(CommandHandler("myid", myid))
