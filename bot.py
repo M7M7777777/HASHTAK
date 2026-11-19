@@ -24,7 +24,7 @@ from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
 
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, filters, PicklePersistence, PersistenceInput
+from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, filters
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -109,8 +109,10 @@ def load_json_store(path, default):
     if errors:
         raise RuntimeError("ذخیره سازی JSON خراب است و نسخه پشتیبان قابل خواندن نیست: " + "; ".join(errors))
     return default
-ACCESS_CHANNEL_ID = -1003734187598
-WIDGET_ARCHIVE_GROUP_ID = -1003916791291
+ACCESS_CHANNEL_ID = -1004301287348
+WIDGET_ARCHIVE_GROUP_ID = -1004301287348
+LEGACY_ACCESS_CHANNEL_ID = -1003734187598
+STORAGE_TOPIC_NAMES = ("تنظیمات", "کاربران", "منابع", "شمارنده ها", "حلقه ها", "پشتیبان", "آرشیو ویجت ها", "گزارش ها")
 ACCESS_STORAGE_MARKER = "TELEGRAM_JOURNAL_ACCESS_V1"
 # Owner ID is fixed in the source so no hosting variable is needed.
 OWNER_ID = 1881579954
@@ -202,14 +204,20 @@ def decrypt_marked_payload(message_text):
 PLAIN_STORAGE_MARKER = "TELEGRAM_JOURNAL_STORAGE_PLAIN_V1"
 
 def validate_storage_payload(data):
-    if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+    if not isinstance(data, dict):
         raise ValueError("ساختار اطلاعات ذخیره شده معتبر نیست")
-    if not isinstance(data.get("ai_config"), dict):
-        raise ValueError("تنظیمات هوش مصنوعی معتبر نیست")
-    if not isinstance(data["ai_config"].get("services"), dict):
-        raise ValueError("فهرست سرویس های هوش مصنوعی معتبر نیست")
-    if data.get("widget_index_file_id") is not None and not isinstance(data.get("widget_index_file_id"), str):
-        raise ValueError("شناسه آرشیو ویجت معتبر نیست")
+    if "users" in data and not isinstance(data.get("users"), list):
+        raise ValueError("فهرست کاربران معتبر نیست")
+    if "ai_config" in data:
+        if not isinstance(data.get("ai_config"), dict):
+            raise ValueError("تنظیمات هوش مصنوعی معتبر نیست")
+        if not isinstance(data["ai_config"].get("services"), dict):
+            raise ValueError("فهرست سرویس های هوش مصنوعی معتبر نیست")
+    for key in ("widget_index_file_id", "runtime_snapshot_file_id", "users_file_id", "ai_config_file_id", "runtime_snapshot_sha256"):
+        if data.get(key) is not None and not isinstance(data.get(key), str):
+            raise ValueError(f"شناسه فایل ذخیره سازی {key} معتبر نیست")
+    if "topics" in data and not isinstance(data.get("topics"), dict):
+        raise ValueError("فهرست تاپیک های ذخیره سازی معتبر نیست")
     return data
 
 def plain_storage_text(payload):
@@ -228,11 +236,15 @@ def parse_plain_storage(message_text):
 def storage_message_text(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
     data = {
-        "users": sorted(bot_data.get("authorized_users", set()) if users is None else users),
-        "ai_config": bot_data.get("ai_config", {"services": {}, "default_service": None}) if ai_config is None else ai_config,
+        "users_file_id": bot_data.get("users_file_id"),
+        "ai_config_file_id": bot_data.get("ai_config_file_id"),
         "widget_index_file_id": bot_data.get("widget_index_file_id"),
+        "runtime_snapshot_file_id": bot_data.get("runtime_snapshot_file_id"),
+        "runtime_snapshot_sha256": bot_data.get("runtime_snapshot_sha256"),
+        "topics": bot_data.get("storage_topics", {}),
     }
-    return encrypt_marked_payload(data)
+    return plain_storage_text(data)
+
 
 async def persist_storage(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
@@ -240,13 +252,41 @@ async def persist_storage(context, users=None, ai_config=None):
     async with lock:
         message_id = bot_data.get("storage_message_id")
         if not message_id:
-            raise RuntimeError("پیام اصلی ذخیره سازی در کانال پیدا نشد")
-        text = storage_message_text(context, users, ai_config)
-        await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
-        if users is not None:
-            bot_data["authorized_users"] = set(users)
-        if ai_config is not None:
-            bot_data["ai_config"] = ai_config
+            raise RuntimeError("پیام اصلی ذخیره سازی گروه پیدا نشد")
+        previous_users_file_id = bot_data.get("users_file_id")
+        previous_ai_file_id = bot_data.get("ai_config_file_id")
+        try:
+            if users is not None:
+                users_raw = json.dumps(sorted(users), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                archived_users = await context.bot.send_document(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_thread_id=(bot_data.get("storage_topics") or {}).get("کاربران"),
+                    document=InputFile(io.BytesIO(users_raw), filename="authorized-users.json"),
+                    caption="فهرست کاربران مجاز · JSON بدون رمزنگاری",
+                    disable_notification=True,
+                )
+                bot_data["users_file_id"] = archived_users.document.file_id
+            if ai_config is not None:
+                ai_raw = json.dumps(ai_config, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+                archived_ai = await context.bot.send_document(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_thread_id=(bot_data.get("storage_topics") or {}).get("تنظیمات"),
+                    document=InputFile(io.BytesIO(ai_raw), filename="ai-config.json"),
+                    caption="تنظیمات و کلیدهای API · متن ساده و بدون رمزنگاری",
+                    disable_notification=True,
+                )
+                bot_data["ai_config_file_id"] = archived_ai.document.file_id
+            text = storage_message_text(context, users, ai_config)
+            await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
+            if users is not None:
+                bot_data["authorized_users"] = set(users)
+            if ai_config is not None:
+                bot_data["ai_config"] = ai_config
+        except Exception:
+            bot_data["users_file_id"] = previous_users_file_id
+            bot_data["ai_config_file_id"] = previous_ai_file_id
+            raise
+
 
 async def persist_ai_config(config, context):
     await persist_storage(context, ai_config=config)
@@ -278,6 +318,7 @@ async def save_widget_index(context):
     packed = gzip.compress(raw, compresslevel=6)
     archived = await context.bot.send_document(
         chat_id=ACCESS_CHANNEL_ID,
+        message_thread_id=(bot_data.get("storage_topics") or {}).get("آرشیو ویجت ها"),
         document=InputFile(io.BytesIO(packed), filename="widget-index.json.gz"),
         caption="Telegram Journal · Widget archive index",
         disable_notification=True,
@@ -308,13 +349,121 @@ async def record_widget_message(context, token, chat_id, message_id, entry=None)
             bot_data["widget_index"] = previous_index or empty_widget_index()
             raise
 
+async def ensure_storage_topics(application, saved_topics=None):
+    topics = {}
+    if isinstance(saved_topics, dict):
+        for name, thread_id in saved_topics.items():
+            if name in STORAGE_TOPIC_NAMES and isinstance(thread_id, int) and thread_id > 0:
+                topics[name] = thread_id
+    for name in STORAGE_TOPIC_NAMES:
+        if name in topics:
+            continue
+        created = await application.bot.create_forum_topic(
+            chat_id=ACCESS_CHANNEL_ID,
+            name=name,
+        )
+        topics[name] = created.message_thread_id
+        await application.bot.send_message(
+            chat_id=ACCESS_CHANNEL_ID,
+            message_thread_id=created.message_thread_id,
+            text=f"📁 بخش ذخیره سازی: {name}\nاطلاعات این بخش به صورت متن ساده یا فایل JSON نگهداری می شود.",
+            disable_notification=True,
+        )
+    application.bot_data["storage_topics"] = topics
+    return topics
+
+
+async def restore_runtime_state(application, file_id):
+    if not file_id:
+        application.bot_data["source_texts"] = {}
+        application.bot_data["topic_loop_states"] = {}
+        return False
+    remote = await application.bot.get_file(file_id)
+    raw = bytes(await remote.download_as_bytearray())
+    snapshot = json.loads(raw.decode("utf-8"))
+    application.bot_data["runtime_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        raise ValueError("ساختار نسخه پشتیبان تلگرام معتبر نیست")
+    sources = snapshot.get("sources", {})
+    loops = snapshot.get("topic_loop_states", {})
+    users = snapshot.get("user_data", {})
+    if not isinstance(sources, dict) or not isinstance(loops, dict) or not isinstance(users, dict):
+        raise ValueError("بخش های نسخه پشتیبان معتبر نیستند")
+    application.bot_data["source_texts"] = sources
+    application.bot_data["topic_loop_states"] = loops
+    for user_id, data in users.items():
+        if str(user_id).isdigit() and isinstance(data, dict):
+            application.user_data[int(user_id)].update(data)
+    save_source_texts(sources)
+    save_topic_loop_states(loops)
+    print(
+        f"Telegram runtime snapshot restored: {len(sources)} sources, "
+        f"{len(users)} user states, {len(loops)} topic loops",
+        flush=True,
+    )
+    return True
+
+
+async def persist_runtime_state(application):
+    bot_data = application.bot_data
+    lock = bot_data.setdefault("runtime_storage_lock", asyncio.Lock())
+    async with lock:
+        snapshot = {
+            "version": 1,
+            "sources": bot_data.get("source_texts", {}),
+            "topic_loop_states": bot_data.get("topic_loop_states", {}),
+            "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
+        }
+        raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        snapshot_hash = hashlib.sha256(raw).hexdigest()
+        if snapshot_hash == bot_data.get("runtime_snapshot_sha256"):
+            return
+        thread_id = (bot_data.get("storage_topics") or {}).get("پشتیبان")
+        archived = await application.bot.send_document(
+            chat_id=ACCESS_CHANNEL_ID,
+            message_thread_id=thread_id,
+            document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.json"),
+            caption="پشتیبان کامل وضعیت ربات · JSON بدون رمزنگاری",
+            disable_notification=True,
+        )
+        previous_id = bot_data.get("runtime_snapshot_file_id")
+        previous_hash = bot_data.get("runtime_snapshot_sha256")
+        bot_data["runtime_snapshot_file_id"] = archived.document.file_id
+        bot_data["runtime_snapshot_sha256"] = snapshot_hash
+        try:
+            context = type("StorageContext", (), {"application": application, "bot": application.bot})()
+            await persist_storage(context)
+        except Exception:
+            bot_data["runtime_snapshot_file_id"] = previous_id
+            bot_data["runtime_snapshot_sha256"] = previous_hash
+            raise
+
+
+async def runtime_snapshot_worker(application):
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await persist_runtime_state(application)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"TELEGRAM RUNTIME BACKUP FAILED: {type(error).__name__}: {error}", flush=True)
+
+
 async def initialize_access_storage(application):
     try:
         chat = await application.bot.get_chat(ACCESS_CHANNEL_ID)
         pinned = chat.pinned_message
+        needs_widget_copy = False
+        pinned_text = ""
         users = set()
         ai_config = {"services": {}, "default_service": None}
         widget_index_file_id = None
+        runtime_snapshot_file_id = None
+        runtime_snapshot_sha256 = None
+        users_file_id = None
+        ai_config_file_id = None
+        saved_topics = {}
         legacy_decryption_failed = False
 
         if pinned:
@@ -323,28 +472,22 @@ async def initialize_access_storage(application):
             first_line = lines[0].strip() if lines else ""
             if first_line == PLAIN_STORAGE_MARKER:
                 saved = parse_plain_storage(pinned_text)
+                if "users" in saved:
+                    users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
+                ai_config = saved.get("ai_config", ai_config)
+                users_file_id = saved.get("users_file_id")
+                ai_config_file_id = saved.get("ai_config_file_id")
+                widget_index_file_id = saved.get("widget_index_file_id")
+                runtime_snapshot_file_id = saved.get("runtime_snapshot_file_id")
+                runtime_snapshot_sha256 = saved.get("runtime_snapshot_sha256")
+                saved_topics = saved.get("topics", {})
+                application.bot_data["storage_message_id"] = pinned.message_id
+            elif first_line == STORAGE_V2_MARKER:
+                saved = decrypt_marked_payload(pinned_text)
                 users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
                 ai_config = saved["ai_config"]
                 widget_index_file_id = saved.get("widget_index_file_id")
                 application.bot_data["storage_message_id"] = pinned.message_id
-            elif first_line == STORAGE_V2_MARKER:
-                try:
-                    saved = decrypt_marked_payload(pinned_text)
-                    users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
-                    ai_config = saved["ai_config"]
-                    widget_index_file_id = saved.get("widget_index_file_id")
-                    application.bot_data["storage_message_id"] = pinned.message_id
-                except Exception as migration_error:
-                    # Keep the old encrypted message untouched as a backup.
-                    # Start a new plain record; local access.json can restore user IDs.
-                    legacy_decryption_failed = True
-                    users = load_access_users()
-                    print(
-                        "WARNING: old encrypted storage could not be read; "
-                        "keeping the original pinned message as backup and creating plain storage. "
-                        f"Reason: {type(migration_error).__name__}: {migration_error}",
-                        flush=True,
-                    )
             elif first_line == ACCESS_STORAGE_MARKER:
                 old_payload = json.loads("\n".join(lines[1:]))
                 if isinstance(old_payload, dict):
@@ -353,19 +496,80 @@ async def initialize_access_storage(application):
                     users = {int(value) for value in old_payload if str(value).isdigit() and int(value) > 0}
                 application.bot_data["storage_message_id"] = pinned.message_id
             else:
-                print("Pinned channel message is not the bot storage record; creating a new plain record.", flush=True)
+                print("Pinned group message is not a bot storage record; checking legacy storage.", flush=True)
 
+        # If this is the first run in the new group, import the old pinned settings.
+        if not application.bot_data.get("storage_message_id"):
+            needs_widget_copy = True
+            try:
+                old_chat = await application.bot.get_chat(LEGACY_ACCESS_CHANNEL_ID)
+                old_pinned = old_chat.pinned_message
+                if old_pinned:
+                    old_text = old_pinned.text or old_pinned.caption or ""
+                    old_lines = old_text.splitlines()
+                    old_marker = old_lines[0].strip() if old_lines else ""
+                    if old_marker == STORAGE_V2_MARKER:
+                        old_saved = decrypt_marked_payload(old_text)
+                        users = {int(v) for v in old_saved.get("users", []) if str(v).isdigit() and int(v) > 0}
+                        ai_config = old_saved.get("ai_config", ai_config)
+                        widget_index_file_id = old_saved.get("widget_index_file_id")
+                    elif old_marker == PLAIN_STORAGE_MARKER:
+                        old_saved = parse_plain_storage(old_text)
+                        users = {int(v) for v in old_saved.get("users", []) if str(v).isdigit() and int(v) > 0}
+                        ai_config = old_saved.get("ai_config", ai_config)
+                        widget_index_file_id = old_saved.get("widget_index_file_id")
+                        users_file_id = old_saved.get("users_file_id")
+                        ai_config_file_id = old_saved.get("ai_config_file_id")
+                        runtime_snapshot_file_id = old_saved.get("runtime_snapshot_file_id")
+                        saved_topics = old_saved.get("topics", {})
+                    elif old_marker == ACCESS_STORAGE_MARKER:
+                        old_payload = json.loads("\n".join(old_lines[1:]))
+                        raw_users = old_payload.get("users", []) if isinstance(old_payload, dict) else old_payload
+                        users = {int(v) for v in raw_users if str(v).isdigit() and int(v) > 0}
+            except Exception as legacy_error:
+                legacy_decryption_failed = True
+                print(f"Legacy storage import unavailable: {type(legacy_error).__name__}: {legacy_error}", flush=True)
+
+        if users_file_id:
+            remote_users = await application.bot.get_file(users_file_id)
+            decoded_users = json.loads(bytes(await remote_users.download_as_bytearray()).decode("utf-8"))
+            if not isinstance(decoded_users, list):
+                raise ValueError("فایل کاربران در گروه تلگرام معتبر نیست")
+            users = {int(value) for value in decoded_users if str(value).isdigit() and int(value) > 0}
+        elif not users:
+            try:
+                users = load_access_users()
+            except Exception:
+                users = set()
+
+        if ai_config_file_id:
+            remote_ai = await application.bot.get_file(ai_config_file_id)
+            decoded_ai = json.loads(bytes(await remote_ai.download_as_bytearray()).decode("utf-8"))
+            if not isinstance(decoded_ai, dict) or not isinstance(decoded_ai.get("services"), dict):
+                raise ValueError("فایل تنظیمات هوش مصنوعی در گروه تلگرام معتبر نیست")
+            ai_config = decoded_ai
+
+        application.bot_data["users_file_id"] = users_file_id
+        application.bot_data["ai_config_file_id"] = ai_config_file_id
         application.bot_data["widget_index_file_id"] = widget_index_file_id
+        application.bot_data["runtime_snapshot_file_id"] = runtime_snapshot_file_id
+        application.bot_data["runtime_snapshot_sha256"] = runtime_snapshot_sha256
+        application.bot_data["authorized_users"] = users
+        application.bot_data["ai_config"] = ai_config
 
+        await ensure_storage_topics(application, saved_topics)
         payload = {
-            "users": sorted(users),
-            "ai_config": ai_config,
+            "users_file_id": users_file_id,
+            "ai_config_file_id": ai_config_file_id,
             "widget_index_file_id": widget_index_file_id,
+            "runtime_snapshot_file_id": runtime_snapshot_file_id,
+            "runtime_snapshot_sha256": runtime_snapshot_sha256,
+            "topics": application.bot_data["storage_topics"],
         }
         if not application.bot_data.get("storage_message_id"):
             message = await application.bot.send_message(
                 chat_id=ACCESS_CHANNEL_ID,
-                text=encrypt_marked_payload(payload),
+                text=plain_storage_text(payload),
                 disable_notification=True,
             )
             await application.bot.pin_chat_message(
@@ -375,54 +579,60 @@ async def initialize_access_storage(application):
             )
             application.bot_data["storage_message_id"] = message.message_id
         else:
-            # Avoid Telegram's "message is not modified" error on clean restarts.
-            desired_storage_text = encrypt_marked_payload(payload)
-            if pinned_text != desired_storage_text:
-                # Successful legacy reads are migrated in place to plain JSON.
+            desired_text = plain_storage_text(payload)
+            if pinned_text != desired_text:
                 await application.bot.edit_message_text(
                     chat_id=ACCESS_CHANNEL_ID,
                     message_id=application.bot_data["storage_message_id"],
-                    text=desired_storage_text,
+                    text=desired_text,
                 )
 
         application.bot_data["access_message_id"] = application.bot_data["storage_message_id"]
-        application.bot_data["authorized_users"] = users
-        application.bot_data["ai_config"] = ai_config
         application.bot_data["access_channel_ready"] = True
         save_access_users(users)
+        storage_context = type("StorageContext", (), {"application": application, "bot": application.bot})()
+        if not users_file_id or not ai_config_file_id:
+            await persist_storage(
+                storage_context,
+                users=users if not users_file_id else None,
+                ai_config=ai_config if not ai_config_file_id else None,
+            )
+
+        restored = False
+        if runtime_snapshot_file_id:
+            restored = await restore_runtime_state(application, runtime_snapshot_file_id)
+        if not restored:
+            application.bot_data["source_texts"] = load_source_texts()
+            application.bot_data["topic_loop_states"] = load_topic_loop_states()
+
         try:
             await load_widget_index(application, widget_index_file_id)
-            if not widget_index_file_id:
+            if not widget_index_file_id or needs_widget_copy:
                 context = type("StartupContext", (), {"application": application, "bot": application.bot})()
                 await save_widget_index(context)
             application.bot_data["widget_archive_ready"] = True
-            print(
-                f"Widget archive loaded: {len(application.bot_data['widget_index'].get('widgets', {}))} widgets",
-                flush=True,
-            )
         except Exception as archive_error:
             application.bot_data["widget_archive_ready"] = False
             application.bot_data["widget_archive_error"] = f"{type(archive_error).__name__}: {archive_error}"
-            print(f"WIDGET ARCHIVE LOAD FAILED; existing archive pointer preserved: {application.bot_data['widget_archive_error']}", flush=True)
+            print(f"WIDGET ARCHIVE LOAD FAILED: {application.bot_data['widget_archive_error']}", flush=True)
+
+        await resume_topic_loops(application)
+        await persist_runtime_state(application)
+        application.create_task(runtime_snapshot_worker(application), name="telegram-runtime-snapshot")
         print(
-            f"Persistent plain channel storage loaded: {len(users)} authorized users; "
-            f"storage_message_id={application.bot_data['storage_message_id']}",
+            f"Telegram storage ready in group {ACCESS_CHANNEL_ID}: users={len(users)}, "
+            f"runtime_snapshot={bool(runtime_snapshot_file_id)}, topics={len(application.bot_data['storage_topics'])}",
             flush=True,
         )
         if legacy_decryption_failed:
-            print(
-                "NOTICE: encrypted settings could not be migrated. User IDs were restored from local access.json when available; "
-                "AI service settings and the old widget-index pointer need manual restoration if they were only in the encrypted message.",
-                flush=True,
-            )
+            print("WARNING: legacy storage could not be fully imported; old group remains untouched.", flush=True)
     except Exception as error:
         application.bot_data["authorized_users"] = set()
         application.bot_data["ai_config"] = {"services": {}, "default_service": None}
         application.bot_data["access_channel_ready"] = False
         startup_error = f"{type(error).__name__}: {error}"
         application.bot_data["access_storage_error"] = startup_error
-        print(f"CRITICAL: persistent channel storage unavailable; refusing to overwrite stored data: {startup_error}", flush=True)
-    await resume_topic_loops(application)
+        print(f"CRITICAL: Telegram group storage unavailable; refusing to overwrite stored data: {startup_error}", flush=True)
 
 
 def load_topic_loop_states():
@@ -460,6 +670,8 @@ async def create_numbered_topic(application, chat_id):
     )
     state["next_number"] = number + 1
     save_topic_loop_states(states)
+    if chat_id == ACCESS_CHANNEL_ID:
+        await persist_runtime_state(application)
 
 
 async def topic_loop_worker(application, chat_id):
@@ -481,7 +693,9 @@ async def topic_loop_worker(application, chat_id):
 
 async def resume_topic_loops(application):
     try:
-        states = load_topic_loop_states()
+        states = application.bot_data.get("topic_loop_states")
+        if not isinstance(states, dict):
+            states = load_topic_loop_states()
     except Exception as error:
         print(
             f"WARNING: topic loop state could not be loaded: {type(error).__name__}: {error}",
@@ -491,7 +705,7 @@ async def resume_topic_loops(application):
     # Keep the forum topic sequence continuous after a Railway redeploy.
     storage_group_key = "-1004301287348"
     storage_group_state = states.setdefault(
-        storage_group_key, {"next_number": 1096, "active": False}
+        storage_group_key, {"next_number": 1096, "active": True}
     )
     storage_group_state["next_number"] = max(
         int(storage_group_state.get("next_number", 1096)), 1096
@@ -547,11 +761,13 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 states[key] = {"next_number": 1, "active": False}
             states[key]["active"] = True
             save_topic_loop_states(states)
+            await persist_runtime_state(context.application)
             try:
                 await create_numbered_topic(context.application, chat.id)
             except Exception:
                 states[key]["active"] = False
                 save_topic_loop_states(states)
+                await persist_runtime_state(context.application)
                 raise
             task = context.application.create_task(
                 topic_loop_worker(context.application, chat.id),
@@ -566,6 +782,7 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 raise ApplicationHandlerStop
             state["active"] = False
             save_topic_loop_states(states)
+            await persist_runtime_state(context.application)
             task = tasks.pop(key, None)
             if task and not task.done():
                 task.cancel()
@@ -806,6 +1023,7 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rich_payload = {
             "chat_id": ACCESS_CHANNEL_ID,
+            "message_thread_id": (context.application.bot_data.get("storage_topics") or {}).get("گزارش ها"),
             "rich_message": {"blocks": blocks, "is_rtl": True},
             "disable_notification": True,
         }
@@ -834,6 +1052,7 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         fallback += "\n\n📨 محتوا:\n" + (message.text or message.caption)
                 await context.bot.send_message(
                     chat_id=ACCESS_CHANNEL_ID,
+                    message_thread_id=(context.application.bot_data.get("storage_topics") or {}).get("گزارش ها"),
                     text=fallback[:4096],
                     disable_notification=True,
                 )
@@ -3779,7 +3998,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.pop("pending", None)
         context.user_data.pop("connector_key_target", None)
-        await update.message.reply_text("✅ کلید به صورت رمزگذاری شده در تنظیمات ذخیره شد" if secret_value != "-" else "✅ کلید اتصال پاک شد", reply_markup=connector_menu(config))
+        await update.message.reply_text("✅ کلید به صورت متن ساده در گروه ذخیره شد" if secret_value != "-" else "✅ کلید اتصال پاک شد", reply_markup=connector_menu(config))
         return
 
     if key == "connector_url":
@@ -5696,14 +5915,9 @@ async def widget_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await receive_media(update, context)
 
-app_persistence = PicklePersistence(
-    filepath=USER_STATE_STORE,
-    store_data=PersistenceInput(bot_data=False, chat_data=False, user_data=True, callback_data=False),
-    update_interval=1,
-)
-app = Application.builder().token(TOKEN).persistence(app_persistence).post_init(initialize_access_storage).build()
-app.bot_data["source_texts"] = load_source_texts()
-app.bot_data["authorized_users"] = load_access_users()
+app = Application.builder().token(TOKEN).post_init(initialize_access_storage).build()
+app.bot_data["source_texts"] = {}
+app.bot_data["authorized_users"] = set()
 # Group -2 records interaction metadata before access checks and handlers.
 app.add_handler(MessageHandler(filters.ALL, audit_log), group=-2)
 app.add_handler(CallbackQueryHandler(audit_log), group=-2)
