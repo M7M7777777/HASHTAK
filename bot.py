@@ -29,7 +29,7 @@ from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.11"
+VERSION = "3.3.12"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -592,11 +592,17 @@ async def ensure_storage_topics(application, saved_topics=None):
         thread_id = topics.get(key)
         if not thread_id:
             continue
-        await application.bot.edit_forum_topic(
-            chat_id=ACCESS_CHANNEL_ID,
-            message_thread_id=thread_id,
-            name=display_name,
-        )
+        try:
+            await application.bot.edit_forum_topic(
+                chat_id=ACCESS_CHANNEL_ID,
+                message_thread_id=thread_id,
+                name=display_name,
+            )
+        except Exception as error:
+            # Telegram returns TOPIC_NOT_MODIFIED when the topic already has
+            # the requested title. This is a successful no-op, not a failure.
+            if "topic_not_modified" not in str(error).lower():
+                raise
     return topics
 
 
