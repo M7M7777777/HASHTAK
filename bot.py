@@ -26,10 +26,11 @@ from decimal import Decimal, InvalidOperation
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, filters
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.12"
+VERSION = "01"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -414,6 +415,25 @@ def readable_storage_texts(application):
     return result
 
 
+async def telegram_storage_call(method, *args, **kwargs):
+    """Retry Telegram storage requests after server-side flood-control delays."""
+    for attempt in range(6):
+        try:
+            return await method(*args, **kwargs)
+        except RetryAfter as error:
+            retry_after = getattr(error, "retry_after", 1)
+            if hasattr(retry_after, "total_seconds"):
+                retry_after = retry_after.total_seconds()
+            delay = max(1.0, float(retry_after)) + 1.0
+            print(
+                f"TELEGRAM STORAGE RATE LIMIT: waiting {delay:.1f}s "
+                f"before retry {attempt + 1}/5",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError("Telegram storage request exceeded the retry limit")
+
+
 async def sync_readable_storage_topics(context):
     bot_data = context.application.bot_data
     topics = bot_data.get("storage_topics") or {}
@@ -426,7 +446,7 @@ async def sync_readable_storage_topics(context):
         message_id = message_ids.get(name)
         if message_id:
             try:
-                await context.bot.edit_message_text(
+                await telegram_storage_call(context.bot.edit_message_text,
                     chat_id=ACCESS_CHANNEL_ID,
                     message_id=message_id,
                     text=text,
@@ -450,7 +470,7 @@ async def sync_readable_storage_topics(context):
                     )
                     continue
         try:
-            sent = await context.bot.send_message(
+            sent = await telegram_storage_call(context.bot.send_message,
                 chat_id=ACCESS_CHANNEL_ID,
                 message_thread_id=thread_id,
                 text=text,
@@ -483,7 +503,7 @@ async def persist_storage(context, users=None, ai_config=None):
                 bot_data["ai_config"] = ai_config
             await sync_readable_storage_topics(context)
             text = storage_message_text(context, users, ai_config)
-            await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
+            await telegram_storage_call(context.bot.edit_message_text, chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
         except Exception:
             bot_data["users_file_id"] = previous_users_file_id
             bot_data["ai_config_file_id"] = previous_ai_file_id
@@ -523,7 +543,7 @@ async def save_widget_index(context):
     index = bot_data.get("widget_index") or empty_widget_index()
     raw = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     packed = gzip.compress(raw, compresslevel=6)
-    archived = await context.bot.send_document(
+    archived = await telegram_storage_call(context.bot.send_document,
         chat_id=ACCESS_CHANNEL_ID,
         message_thread_id=(bot_data.get("storage_topics") or {}).get("آرشیو ویجت ها"),
         document=InputFile(io.BytesIO(packed), filename="widget-index.json.gz"),
@@ -565,12 +585,12 @@ async def ensure_storage_topics(application, saved_topics=None):
     for name in STORAGE_TOPIC_NAMES:
         if name in topics:
             continue
-        created = await application.bot.create_forum_topic(
+        created = await telegram_storage_call(application.bot.create_forum_topic,
             chat_id=ACCESS_CHANNEL_ID,
             name=name,
         )
         topics[name] = created.message_thread_id
-        await application.bot.send_message(
+        await telegram_storage_call(application.bot.send_message,
             chat_id=ACCESS_CHANNEL_ID,
             message_thread_id=created.message_thread_id,
             text=f"📁 بخش ذخیره سازی: {name}\nاطلاعات این بخش به صورت متن ساده یا فایل JSON نگهداری می شود.",
@@ -593,7 +613,7 @@ async def ensure_storage_topics(application, saved_topics=None):
         if not thread_id:
             continue
         try:
-            await application.bot.edit_forum_topic(
+            await telegram_storage_call(application.bot.edit_forum_topic,
                 chat_id=ACCESS_CHANNEL_ID,
                 message_thread_id=thread_id,
                 name=display_name,
@@ -681,7 +701,7 @@ async def persist_runtime_state(application):
         if snapshot_hash == bot_data.get("runtime_snapshot_sha256"):
             return
         thread_id = (bot_data.get("storage_topics") or {}).get("پشتیبان")
-        archived = await application.bot.send_document(
+        archived = await telegram_storage_call(application.bot.send_document,
             chat_id=ACCESS_CHANNEL_ID,
             message_thread_id=thread_id,
             document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.json"),
