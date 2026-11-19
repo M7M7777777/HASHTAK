@@ -460,6 +460,7 @@ async def initialize_access_storage(application):
         ai_config = {"services": {}, "default_service": None}
         widget_index_file_id = None
         runtime_snapshot_file_id = None
+        runtime_snapshot_sha256 = None
         users_file_id = None
         ai_config_file_id = None
         saved_topics = {}
@@ -478,6 +479,7 @@ async def initialize_access_storage(application):
                 ai_config_file_id = saved.get("ai_config_file_id")
                 widget_index_file_id = saved.get("widget_index_file_id")
                 runtime_snapshot_file_id = saved.get("runtime_snapshot_file_id")
+                runtime_snapshot_sha256 = saved.get("runtime_snapshot_sha256")
                 saved_topics = saved.get("topics", {})
                 application.bot_data["storage_message_id"] = pinned.message_id
             elif first_line == STORAGE_V2_MARKER:
@@ -551,6 +553,7 @@ async def initialize_access_storage(application):
         application.bot_data["ai_config_file_id"] = ai_config_file_id
         application.bot_data["widget_index_file_id"] = widget_index_file_id
         application.bot_data["runtime_snapshot_file_id"] = runtime_snapshot_file_id
+        application.bot_data["runtime_snapshot_sha256"] = runtime_snapshot_sha256
         application.bot_data["authorized_users"] = users
         application.bot_data["ai_config"] = ai_config
 
@@ -560,6 +563,7 @@ async def initialize_access_storage(application):
             "ai_config_file_id": ai_config_file_id,
             "widget_index_file_id": widget_index_file_id,
             "runtime_snapshot_file_id": runtime_snapshot_file_id,
+            "runtime_snapshot_sha256": runtime_snapshot_sha256,
             "topics": application.bot_data["storage_topics"],
         }
         if not application.bot_data.get("storage_message_id"):
