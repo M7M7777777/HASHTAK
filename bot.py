@@ -452,6 +452,8 @@ async def initialize_access_storage(application):
         ai_config = {"services": {}, "default_service": None}
         widget_index_file_id = None
         runtime_snapshot_file_id = None
+        users_file_id = None
+        ai_config_file_id = None
         saved_topics = {}
         legacy_decryption_failed = False
 
@@ -461,8 +463,11 @@ async def initialize_access_storage(application):
             first_line = lines[0].strip() if lines else ""
             if first_line == PLAIN_STORAGE_MARKER:
                 saved = parse_plain_storage(pinned_text)
-                users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
-                ai_config = saved["ai_config"]
+                if "users" in saved:
+                    users = {int(value) for value in saved["users"] if str(value).isdigit() and int(value) > 0}
+                ai_config = saved.get("ai_config", ai_config)
+                users_file_id = saved.get("users_file_id")
+                ai_config_file_id = saved.get("ai_config_file_id")
                 widget_index_file_id = saved.get("widget_index_file_id")
                 runtime_snapshot_file_id = saved.get("runtime_snapshot_file_id")
                 saved_topics = saved.get("topics", {})
@@ -502,6 +507,10 @@ async def initialize_access_storage(application):
                         users = {int(v) for v in old_saved.get("users", []) if str(v).isdigit() and int(v) > 0}
                         ai_config = old_saved.get("ai_config", ai_config)
                         widget_index_file_id = old_saved.get("widget_index_file_id")
+                        users_file_id = old_saved.get("users_file_id")
+                        ai_config_file_id = old_saved.get("ai_config_file_id")
+                        runtime_snapshot_file_id = old_saved.get("runtime_snapshot_file_id")
+                        saved_topics = old_saved.get("topics", {})
                     elif old_marker == ACCESS_STORAGE_MARKER:
                         old_payload = json.loads("\n".join(old_lines[1:]))
                         raw_users = old_payload.get("users", []) if isinstance(old_payload, dict) else old_payload
@@ -510,12 +519,27 @@ async def initialize_access_storage(application):
                 legacy_decryption_failed = True
                 print(f"Legacy storage import unavailable: {type(legacy_error).__name__}: {legacy_error}", flush=True)
 
-        if not users:
+        if users_file_id:
+            remote_users = await application.bot.get_file(users_file_id)
+            decoded_users = json.loads(bytes(await remote_users.download_as_bytearray()).decode("utf-8"))
+            if not isinstance(decoded_users, list):
+                raise ValueError("فایل کاربران در گروه تلگرام معتبر نیست")
+            users = {int(value) for value in decoded_users if str(value).isdigit() and int(value) > 0}
+        elif not users:
             try:
                 users = load_access_users()
             except Exception:
                 users = set()
 
+        if ai_config_file_id:
+            remote_ai = await application.bot.get_file(ai_config_file_id)
+            decoded_ai = json.loads(bytes(await remote_ai.download_as_bytearray()).decode("utf-8"))
+            if not isinstance(decoded_ai, dict) or not isinstance(decoded_ai.get("services"), dict):
+                raise ValueError("فایل تنظیمات هوش مصنوعی در گروه تلگرام معتبر نیست")
+            ai_config = decoded_ai
+
+        application.bot_data["users_file_id"] = users_file_id
+        application.bot_data["ai_config_file_id"] = ai_config_file_id
         application.bot_data["widget_index_file_id"] = widget_index_file_id
         application.bot_data["runtime_snapshot_file_id"] = runtime_snapshot_file_id
         application.bot_data["authorized_users"] = users
@@ -523,8 +547,8 @@ async def initialize_access_storage(application):
 
         await ensure_storage_topics(application, saved_topics)
         payload = {
-            "users": sorted(users),
-            "ai_config": ai_config,
+            "users_file_id": users_file_id,
+            "ai_config_file_id": ai_config_file_id,
             "widget_index_file_id": widget_index_file_id,
             "runtime_snapshot_file_id": runtime_snapshot_file_id,
             "topics": application.bot_data["storage_topics"],
@@ -553,6 +577,13 @@ async def initialize_access_storage(application):
         application.bot_data["access_message_id"] = application.bot_data["storage_message_id"]
         application.bot_data["access_channel_ready"] = True
         save_access_users(users)
+        storage_context = type("StorageContext", (), {"application": application, "bot": application.bot})()
+        if not users_file_id or not ai_config_file_id:
+            await persist_storage(
+                storage_context,
+                users=users if not users_file_id else None,
+                ai_config=ai_config if not ai_config_file_id else None,
+            )
 
         restored = False
         if runtime_snapshot_file_id:
