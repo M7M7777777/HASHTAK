@@ -29,7 +29,7 @@ from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.10"
+VERSION = "3.3.11"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -478,26 +478,6 @@ async def persist_storage(context, users=None, ai_config=None):
         previous_ai_config = bot_data.get("ai_config")
         try:
             if users is not None:
-                users_raw = json.dumps(sorted(users), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                archived_users = await context.bot.send_document(
-                    chat_id=ACCESS_CHANNEL_ID,
-                    message_thread_id=(bot_data.get("storage_topics") or {}).get("کاربران"),
-                    document=InputFile(io.BytesIO(users_raw), filename="authorized-users.json"),
-                    caption="فهرست کاربران مجاز · JSON بدون رمزنگاری",
-                    disable_notification=True,
-                )
-                bot_data["users_file_id"] = archived_users.document.file_id
-            if ai_config is not None:
-                ai_raw = json.dumps(ai_config, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
-                archived_ai = await context.bot.send_document(
-                    chat_id=ACCESS_CHANNEL_ID,
-                    message_thread_id=(bot_data.get("storage_topics") or {}).get("تنظیمات"),
-                    document=InputFile(io.BytesIO(ai_raw), filename="ai-config.json"),
-                    caption="تنظیمات و کلیدهای API · متن ساده و بدون رمزنگاری",
-                    disable_notification=True,
-                )
-                bot_data["ai_config_file_id"] = archived_ai.document.file_id
-            if users is not None:
                 bot_data["authorized_users"] = set(users)
             if ai_config is not None:
                 bot_data["ai_config"] = ai_config
@@ -516,6 +496,7 @@ async def persist_storage(context, users=None, ai_config=None):
 
 async def persist_ai_config(config, context):
     await persist_storage(context, ai_config=config)
+    await persist_runtime_state(context.application)
 
 def empty_widget_index():
     return {"version": 1, "widgets": {}, "messages": {}}
@@ -635,15 +616,29 @@ async def restore_runtime_state(application, file_id):
     loops = snapshot.get("topic_loop_states", {})
     users = snapshot.get("user_data", {})
     user_audit_topics = snapshot.get("user_audit_topics", {})
+    authorized_users = snapshot.get("authorized_users")
+    ai_config = snapshot.get("ai_config")
     if (
         not isinstance(sources, dict)
         or not isinstance(loops, dict)
         or not isinstance(users, dict)
         or not isinstance(user_audit_topics, dict)
+        or (authorized_users is not None and not isinstance(authorized_users, list))
+        or (ai_config is not None and (
+            not isinstance(ai_config, dict)
+            or not isinstance(ai_config.get("services", {}), dict)
+        ))
     ):
         raise ValueError("بخش های نسخه پشتیبان معتبر نیستند")
     application.bot_data["source_texts"] = sources
     application.bot_data["topic_loop_states"] = loops
+    if authorized_users is not None:
+        application.bot_data["authorized_users"] = {
+            int(user_id) for user_id in authorized_users
+            if str(user_id).isdigit() and int(user_id) > 0
+        }
+    if ai_config is not None:
+        application.bot_data["ai_config"] = ai_config
     application.bot_data["user_audit_topics"] = {
         str(user_id): thread_id
         for user_id, thread_id in user_audit_topics.items()
@@ -671,6 +666,8 @@ async def persist_runtime_state(application):
             "sources": bot_data.get("source_texts", {}),
             "topic_loop_states": bot_data.get("topic_loop_states", {}),
             "user_audit_topics": bot_data.get("user_audit_topics", {}),
+            "authorized_users": sorted(bot_data.get("authorized_users", set())),
+            "ai_config": bot_data.get("ai_config") or ai_default_config(),
             "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
         }
         raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
@@ -810,8 +807,10 @@ async def initialize_access_storage(application):
                 raise ValueError("فایل تنظیمات هوش مصنوعی در گروه تلگرام معتبر نیست")
             ai_config = decoded_ai
 
-        application.bot_data["users_file_id"] = users_file_id
-        application.bot_data["ai_config_file_id"] = ai_config_file_id
+        # Legacy files are read for migration only. New backups keep all state
+        # together in the technical snapshot inside the backup topic.
+        application.bot_data["users_file_id"] = None
+        application.bot_data["ai_config_file_id"] = None
         application.bot_data["widget_index_file_id"] = widget_index_file_id
         application.bot_data["runtime_snapshot_file_id"] = runtime_snapshot_file_id
         application.bot_data["runtime_snapshot_sha256"] = runtime_snapshot_sha256
@@ -1378,6 +1377,7 @@ async def persist_access_users(users, context):
         raise RuntimeError("ذخیره سازی کانال آماده نیست؛ اطلاعات قبلی دست نخورده باقی ماند." + detail)
     try:
         await persist_storage(context, users=users)
+        await persist_runtime_state(context.application)
         save_access_users(users)
     except Exception as error:
         print(f"PERSISTENT STORAGE UPDATE FAILED: {type(error).__name__}: {error}", flush=True)
