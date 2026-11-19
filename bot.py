@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "05"
+VERSION = "06"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -994,7 +994,11 @@ def load_topic_loop_states():
         next_number = state.get("next_number", 1)
         active = state.get("active", False)
         if isinstance(next_number, int) and next_number > 0 and isinstance(active, bool):
-            states[str(int(chat_id))] = {"next_number": next_number, "active": active}
+            normalized = {"next_number": next_number, "active": active}
+            pending_number = state.get("pending_number")
+            if isinstance(pending_number, int) and pending_number > 0:
+                normalized["pending_number"] = pending_number
+            states[str(int(chat_id))] = normalized
     return states
 
 
@@ -6224,6 +6228,7 @@ async def send_html_widget(message, html, context):
         raise RuntimeError("ساخت کد کوتاه یکتا ممکن نشد، دوباره تلاش کن.")
     archived = await context.bot.send_document(
         chat_id=ACCESS_CHANNEL_ID,
+        message_thread_id=(bot_data.get("storage_topics") or {}).get("آرشیو ویجت ها"),
         document=InputFile(
             io.BytesIO(html.encode("utf-8")),
             filename=f"widget-{token}.html",
