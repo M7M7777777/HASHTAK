@@ -447,6 +447,7 @@ async def initialize_access_storage(application):
     try:
         chat = await application.bot.get_chat(ACCESS_CHANNEL_ID)
         pinned = chat.pinned_message
+        needs_widget_copy = not bool(application.bot_data.get("storage_message_id"))
         pinned_text = ""
         users = set()
         ai_config = {"services": {}, "default_service": None}
@@ -594,7 +595,7 @@ async def initialize_access_storage(application):
 
         try:
             await load_widget_index(application, widget_index_file_id)
-            if not widget_index_file_id:
+            if not widget_index_file_id or needs_widget_copy:
                 context = type("StartupContext", (), {"application": application, "bot": application.bot})()
                 await save_widget_index(context)
             application.bot_data["widget_archive_ready"] = True
@@ -680,7 +681,9 @@ async def topic_loop_worker(application, chat_id):
 
 async def resume_topic_loops(application):
     try:
-        states = application.bot_data.get("topic_loop_states") or load_topic_loop_states()
+        states = application.bot_data.get("topic_loop_states")
+        if not isinstance(states, dict):
+            states = load_topic_loop_states()
     except Exception as error:
         print(
             f"WARNING: topic loop state could not be loaded: {type(error).__name__}: {error}",
