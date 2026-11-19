@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "04"
+VERSION = "05"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -4106,14 +4106,30 @@ def wallex_tmn_price(asset, markets, usdt_tmn=None):
         graph.setdefault(base, []).append((quote_asset, price))
         graph.setdefault(quote_asset, []).append((base, Decimal("1") / price))
 
-    # Breadth-first search finds a conversion route to Toman.
+    # Prefer a direct Toman market whenever it exists. A normal BFS can
+    # otherwise take an earlier-listed BTC/ETH route before checking a direct
+    # asset/TMN market, producing a less reliable valuation.
+    direct = [
+        rate for next_asset, rate in graph.get(asset, [])
+        if next_asset == "TMN" and rate > 0
+    ]
+    if direct:
+        return direct[0]
+
+    # For indirect conversion, use the shortest route and give stablecoin
+    # markets deterministic priority over volatile bridge assets.
+    bridge_priority = {"USDT": 0, "USDC": 1, "TMN": -1, "BTC": 2, "ETH": 3}
     queue = [(asset, Decimal("1"))]
     visited = {asset}
     while queue:
         current, rate = queue.pop(0)
-        if current == "TMN":
-            return rate
-        for next_asset, edge_rate in graph.get(current, []):
+        edges = sorted(
+            graph.get(current, []),
+            key=lambda edge: (bridge_priority.get(edge[0], 4), edge[0]),
+        )
+        for next_asset, edge_rate in edges:
+            if next_asset == "TMN":
+                return rate * edge_rate
             if next_asset not in visited:
                 visited.add(next_asset)
                 queue.append((next_asset, rate * edge_rate))
