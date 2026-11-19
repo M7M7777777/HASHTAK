@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import copy
 import gzip
 import html as html_lib
@@ -30,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "03"
+VERSION = "04"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -553,8 +554,16 @@ async def load_widget_index(application, file_id):
         return
     remote = await application.bot.get_file(file_id)
     content = await remote.download_as_bytearray()
-    raw = gzip.decompress(bytes(content))
-    index = json.loads(raw.decode("utf-8"))
+    downloaded = bytes(content)
+    try:
+        # New archives are UTF-8 text containing a Python literal structure.
+        index = ast.literal_eval(downloaded.decode("utf-8"))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        # Backward compatibility with old JSON.GZ widget indexes.
+        try:
+            index = json.loads(gzip.decompress(downloaded).decode("utf-8"))
+        except Exception:
+            index = json.loads(downloaded.decode("utf-8"))
     if (
         not isinstance(index, dict)
         or index.get("version") != 1
@@ -567,13 +576,12 @@ async def load_widget_index(application, file_id):
 async def save_widget_index(context):
     bot_data = context.application.bot_data
     index = bot_data.get("widget_index") or empty_widget_index()
-    raw = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    packed = gzip.compress(raw, compresslevel=6)
+    raw = repr(index).encode("utf-8")
     archived = await telegram_storage_call(context.bot.send_document,
         chat_id=ACCESS_CHANNEL_ID,
         message_thread_id=(bot_data.get("storage_topics") or {}).get("آرشیو ویجت ها"),
-        document=InputFile(io.BytesIO(packed), filename="widget-index.json.gz"),
-        caption="Telegram Journal · Widget archive index",
+        document=InputFile(io.BytesIO(raw), filename="widget-index.txt"),
+        caption="فهرست آرشیو ویجت ها · متن ساده",
         disable_notification=True,
     )
     # Upload first, then move the plain-text root pointer. An interrupted update
@@ -660,7 +668,11 @@ async def restore_runtime_state(application, file_id):
         return False
     remote = await application.bot.get_file(file_id)
     raw = bytes(await remote.download_as_bytearray())
-    snapshot = json.loads(raw.decode("utf-8"))
+    try:
+        snapshot = ast.literal_eval(raw.decode("utf-8"))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        # Read backups created by older versions during migration.
+        snapshot = json.loads(raw.decode("utf-8"))
     application.bot_data["runtime_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
     if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
         raise ValueError("ساختار نسخه پشتیبان تلگرام معتبر نیست")
@@ -722,7 +734,7 @@ async def persist_runtime_state(application):
             "ai_config": bot_data.get("ai_config") or ai_default_config(),
             "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
         }
-        raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        raw = repr(snapshot).encode("utf-8")
         snapshot_hash = hashlib.sha256(raw).hexdigest()
         if snapshot_hash == bot_data.get("runtime_snapshot_sha256"):
             return
@@ -730,8 +742,8 @@ async def persist_runtime_state(application):
         archived = await telegram_storage_call(application.bot.send_document,
             chat_id=ACCESS_CHANNEL_ID,
             message_thread_id=thread_id,
-            document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.json"),
-            caption="پشتیبان کامل وضعیت ربات · JSON بدون رمزنگاری",
+            document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.txt"),
+            caption="پشتیبان کامل وضعیت ربات · فایل متنی UTF-8",
             disable_notification=True,
         )
         previous_id = bot_data.get("runtime_snapshot_file_id")
