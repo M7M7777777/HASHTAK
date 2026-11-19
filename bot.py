@@ -25,10 +25,11 @@ from decimal import Decimal, InvalidOperation
 
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, filters
+from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.5"
+VERSION = "3.3.7"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -377,6 +378,7 @@ async def restore_runtime_state(application, file_id):
     if not file_id:
         application.bot_data["source_texts"] = {}
         application.bot_data["topic_loop_states"] = {}
+        application.bot_data["user_audit_topics"] = {}
         return False
     remote = await application.bot.get_file(file_id)
     raw = bytes(await remote.download_as_bytearray())
@@ -387,10 +389,21 @@ async def restore_runtime_state(application, file_id):
     sources = snapshot.get("sources", {})
     loops = snapshot.get("topic_loop_states", {})
     users = snapshot.get("user_data", {})
-    if not isinstance(sources, dict) or not isinstance(loops, dict) or not isinstance(users, dict):
+    user_audit_topics = snapshot.get("user_audit_topics", {})
+    if (
+        not isinstance(sources, dict)
+        or not isinstance(loops, dict)
+        or not isinstance(users, dict)
+        or not isinstance(user_audit_topics, dict)
+    ):
         raise ValueError("بخش های نسخه پشتیبان معتبر نیستند")
     application.bot_data["source_texts"] = sources
     application.bot_data["topic_loop_states"] = loops
+    application.bot_data["user_audit_topics"] = {
+        str(user_id): thread_id
+        for user_id, thread_id in user_audit_topics.items()
+        if str(user_id).isdigit() and isinstance(thread_id, int) and thread_id > 0
+    }
     for user_id, data in users.items():
         if str(user_id).isdigit() and isinstance(data, dict):
             application.user_data[int(user_id)].update(data)
@@ -412,6 +425,7 @@ async def persist_runtime_state(application):
             "version": 1,
             "sources": bot_data.get("source_texts", {}),
             "topic_loop_states": bot_data.get("topic_loop_states", {}),
+            "user_audit_topics": bot_data.get("user_audit_topics", {}),
             "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
         }
         raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
@@ -877,8 +891,42 @@ def audit_callback_label(query):
     return "دکمه دیگر"
 
 
+async def ensure_user_audit_topic(context, user):
+    """برای هر کاربر یک تاپیک اختصاصی بساز و شناسه آن را در نسخه پشتیبان نگه دار."""
+    application = context.application
+    bot_data = application.bot_data
+    lock = bot_data.setdefault("user_audit_topics_lock", asyncio.Lock())
+    async with lock:
+        topics = bot_data.setdefault("user_audit_topics", {})
+        user_key = str(user.id)
+        existing = topics.get(user_key)
+        if isinstance(existing, int) and existing > 0:
+            return existing
+
+        full_name = " ".join(
+            part for part in [user.first_name, user.last_name] if part
+        ).strip() or "کاربر"
+        topic_name = f"👤 {full_name} · {user.id}"[:128]
+        created = await context.bot.create_forum_topic(
+            chat_id=ACCESS_CHANNEL_ID,
+            name=topic_name,
+        )
+        thread_id = created.message_thread_id
+        topics[user_key] = thread_id
+        try:
+            await persist_runtime_state(application)
+        except Exception as error:
+            # Keep the in-memory mapping; the periodic snapshot worker retries it.
+            print(
+                f"USER AUDIT TOPIC MAP SAVE FAILED user_id={user.id}: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+        return thread_id
+
+
 async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ثبت هر رویداد در یک پیام Rich Message، همراه با رسانه اصلی."""
+    """ثبت هر رویداد در تاپیک اختصاصی همان کاربر، همراه با رسانه اصلی."""
     try:
         user = update.effective_user
         if not user:
@@ -1021,9 +1069,10 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "is_open": False,
             })
 
+        audit_thread_id = await ensure_user_audit_topic(context, user)
         rich_payload = {
             "chat_id": ACCESS_CHANNEL_ID,
-            "message_thread_id": (context.application.bot_data.get("storage_topics") or {}).get("گزارش ها"),
+            "message_thread_id": audit_thread_id,
             "rich_message": {"blocks": blocks, "is_rtl": True},
             "disable_notification": True,
         }
@@ -1050,9 +1099,10 @@ async def audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         fallback += "\n\n📨 [اطلاعات محرمانه مخفی شد]"
                     else:
                         fallback += "\n\n📨 محتوا:\n" + (message.text or message.caption)
+                audit_thread_id = await ensure_user_audit_topic(context, user)
                 await context.bot.send_message(
                     chat_id=ACCESS_CHANNEL_ID,
-                    message_thread_id=(context.application.bot_data.get("storage_topics") or {}).get("گزارش ها"),
+                    message_thread_id=audit_thread_id,
                     text=fallback[:4096],
                     disable_notification=True,
                 )
@@ -5915,7 +5965,31 @@ async def widget_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await receive_media(update, context)
 
-app = Application.builder().token(TOKEN).post_init(initialize_access_storage).build()
+# Telegram storage operations include multi-file uploads. PTB's default HTTPX
+# timeouts are too short for these requests on slower Railway/network links.
+telegram_request = HTTPXRequest(
+    connection_pool_size=32,
+    connect_timeout=20.0,
+    read_timeout=60.0,
+    write_timeout=120.0,
+    pool_timeout=30.0,
+    media_write_timeout=180.0,
+)
+telegram_updates_request = HTTPXRequest(
+    connection_pool_size=8,
+    connect_timeout=20.0,
+    read_timeout=60.0,
+    write_timeout=30.0,
+    pool_timeout=30.0,
+)
+app = (
+    Application.builder()
+    .token(TOKEN)
+    .request(telegram_request)
+    .get_updates_request(telegram_updates_request)
+    .post_init(initialize_access_storage)
+    .build()
+)
 app.bot_data["source_texts"] = {}
 app.bot_data["authorized_users"] = set()
 # Group -2 records interaction metadata before access checks and handlers.
