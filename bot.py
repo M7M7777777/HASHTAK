@@ -979,6 +979,15 @@ async def start_background_storage_init(application):
     )
 
 
+async def stop_startup_tasks(application):
+    tasks = list(application.bot_data.pop("_startup_tasks", set()))
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def initialize_access_storage(application):
     try:
         chat = await telegram_storage_call(application.bot.get_chat, ACCESS_CHANNEL_ID)
@@ -6814,6 +6823,7 @@ app = (
     .request(telegram_request)
     .get_updates_request(telegram_updates_request)
     .post_init(start_background_storage_init)
+    .post_shutdown(stop_startup_tasks)
     .build()
 )
 try:
