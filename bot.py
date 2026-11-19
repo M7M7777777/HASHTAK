@@ -30,6 +30,11 @@ from telegram.request import HTTPXRequest
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 VERSION = "16"
 MCP_MODERN_VERSION = "2026-07-28"
