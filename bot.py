@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "07"
+VERSION = "08"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -504,33 +504,43 @@ def _rich_storage_digest(payload):
     return hashlib.sha256(raw).hexdigest()
 
 
+RICH_STORAGE_PLAIN_MARKER = "HSTK-RICH-PLAIN-1:"
+
 def encode_rich_storage_payload(payload):
-    raw = repr(payload).encode("utf-8")
-    compressed = zlib.compress(raw, 9)
-    encryption_key, authentication_key = ai_keys()
-    nonce = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-NONCE" + compressed, hashlib.sha256).digest()[:16]
-    ciphertext = ai_xor_stream(compressed, encryption_key, nonce)
-    tag = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext, hashlib.sha256).digest()
-    return "HSTK-RICH-1:" + base64.urlsafe_b64encode(nonce + ciphertext + tag).decode("ascii")
+    # New backups are deliberately plain JSON so they can be read in Telegram.
+    return RICH_STORAGE_PLAIN_MARKER + json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), default=str
+    )
 
 
 def decode_rich_storage_payload(encoded):
-    if not isinstance(encoded, str) or not encoded.startswith("HSTK-RICH-1:"):
+    if not isinstance(encoded, str):
+        raise ValueError("داده پشتیبان Rich Message معتبر نیست")
+    if encoded.startswith(RICH_STORAGE_PLAIN_MARKER):
+        payload = json.loads(encoded[len(RICH_STORAGE_PLAIN_MARKER):])
+    elif encoded.startswith("HSTK-RICH-1:"):
+        # One-time compatibility with the previous encrypted format.
+        packed = base64.urlsafe_b64decode(encoded.split(":", 1)[1].encode("ascii"))
+        if len(packed) < 48:
+            raise ValueError("داده پشتیبان Rich Message ناقص است")
+        nonce, ciphertext, supplied_tag = packed[:16], packed[16:-32], packed[-32:]
+        encryption_key, authentication_key = ai_keys()
+        expected_tag = hmac.new(
+            authentication_key,
+            b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(supplied_tag, expected_tag):
+            raise ValueError("اعتبارسنجی نسخه قدیمی پشتیبان ناموفق بود")
+        decoded = zlib.decompress(
+            ai_xor_stream(ciphertext, encryption_key, nonce)
+        ).decode("utf-8")
+        try:
+            payload = ast.literal_eval(decoded)
+        except (SyntaxError, ValueError):
+            payload = json.loads(decoded)
+    else:
         raise ValueError("نشانگر داده پشتیبان Rich Message معتبر نیست")
-    packed = base64.urlsafe_b64decode(encoded.split(":", 1)[1].encode("ascii"))
-    if len(packed) < 48:
-        raise ValueError("داده پشتیبان Rich Message ناقص است")
-    nonce, ciphertext, supplied_tag = packed[:16], packed[16:-32], packed[-32:]
-    encryption_key, authentication_key = ai_keys()
-    expected_tag = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext, hashlib.sha256).digest()
-    if not hmac.compare_digest(supplied_tag, expected_tag):
-        raise ValueError("اعتبارسنجی داده پشتیبان Rich Message ناموفق بود")
-    decoded = zlib.decompress(ai_xor_stream(ciphertext, encryption_key, nonce)).decode("utf-8")
-    try:
-        payload = ast.literal_eval(decoded)
-    except (SyntaxError, ValueError):
-        # Read the short-lived JSON-encoded Rich Message format during migration.
-        payload = json.loads(decoded)
     if not isinstance(payload, dict) or payload.get("version") != 1:
         raise ValueError("نسخه داده پشتیبان Rich Message معتبر نیست")
     return payload
@@ -550,8 +560,10 @@ def extract_rich_storage_payload(message):
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "pre" and isinstance(block.get("text"), str) and block["text"].startswith("HSTK-RICH-1:"):
-                found.append(block["text"])
+            if block.get("type") == "pre" and isinstance(block.get("text"), str):
+                text = block["text"]
+                if text.startswith((RICH_STORAGE_PLAIN_MARKER, "HSTK-RICH-1:")):
+                    found.append(text)
             walk(block.get("blocks"))
 
     walk(rich.get("blocks"))
@@ -577,6 +589,7 @@ def build_rich_storage_message(context):
     }
     payload = {"version": 1, "storage": storage, "runtime": snapshot}
     encoded = encode_rich_storage_payload(payload)
+
     users = storage["authorized_users"]
     ai_config = storage["ai_config"]
     services = ai_config.get("services", {}) if isinstance(ai_config, dict) else {}
@@ -585,20 +598,37 @@ def build_rich_storage_message(context):
     user_data = snapshot.get("user_data", {})
     audits = snapshot.get("user_audit_topics", {})
     widgets = (bot_data.get("widget_index") or {}).get("widgets", {})
+
+    def json_block(value):
+        return {"type": "pre", "text": json.dumps(
+            value, ensure_ascii=False, indent=2, default=str
+        )}
+
     rich_message = {"blocks": [
         {"type": "heading", "size": 1, "text": "🗄️ مرکز ذخیره سازی HASHTAK"},
-        {"type": "paragraph", "text": "نسخه اصلی و قابل بازیابی اطلاعات ربات · بروزرسانی فقط هنگام تغییر"},
-        {"type": "details", "summary": "👥 کاربران و دسترسی ها", "blocks": [{"type": "paragraph", "text": f"کاربران مجاز: {len(users)}"}]},
-        {"type": "details", "summary": "🤖 تنظیمات هوش مصنوعی", "blocks": [{"type": "paragraph", "text": f"سرویس ها: {len(services)} · پیش فرض: {ai_config.get('default_service') or 'انتخاب نشده'}"}]},
-        {"type": "details", "summary": "📚 منابع و تاپیک ها", "blocks": [{"type": "paragraph", "text": f"منابع: {len(sources)} · حلقه های تاپیک: {len(loops)} · گزارش ها: {len(audits)}"}]},
-        {"type": "details", "summary": "🧩 آرشیو و اطلاعات کاربران", "blocks": [{"type": "paragraph", "text": f"اطلاعات کاربران: {len(user_data)} · ویجت های آرشیو: {len(widgets)}"}]},
+        {"type": "paragraph", "text": "اطلاعات به صورت متن ساده ذخیره میشن و همین پیام با تغییر اطلاعات ویرایش میشه"},
+        {"type": "details", "summary": f"👥 کاربران و دسترسی ها · {len(users)} کاربر مجاز",
+         "blocks": [json_block({"owner_id": OWNER_ID, "authorized_users": users, "user_data": user_data})]},
+        {"type": "details", "summary": f"🤖 تنظیمات هوش مصنوعی · {len(services)} سرویس",
+         "blocks": [json_block(ai_config)]},
+        {"type": "details", "summary": f"📚 منابع ذخیره شده · {len(sources)} منبع",
+         "blocks": [json_block(sources)]},
+        {"type": "details", "summary": f"🔁 تاپیک ها و حلقه ها · {len(loops)} حلقه",
+         "blocks": [json_block({"topic_loop_states": loops, "user_audit_topics": audits, "storage_topics": storage["topics"]})]},
+        {"type": "details", "summary": f"🧩 آرشیو ویجت ها · {len(widgets)} ویجت",
+         "blocks": [json_block({"widget_index_file_id": storage["widget_index_file_id"], "widget_count": len(widgets)})]},
         {"type": "divider"},
-        {"type": "details", "summary": "🔐 داده کامل رمزگذاری شده برای بازیابی خودکار", "blocks": [{"type": "pre", "text": encoded}]},
+        {"type": "details", "summary": "📦 نسخه کامل قابل بازیابی · JSON ساده و خوانا",
+         "blocks": [{"type": "pre", "text": encoded}]},
         {"type": "footer", "text": f"آخرین بروزرسانی: {persian_timestamp()}"},
     ], "is_rtl": True}
-    serialized_size = len(json.dumps(rich_message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    serialized_size = len(json.dumps(
+        rich_message, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8"))
     if serialized_size > MAX_RICH_TEXT_BYTES:
-        raise ValueError(f"حجم نسخه پشتیبان Rich Message از حد مجاز بیشتر شد ({serialized_size} بایت)")
+        raise ValueError(
+            f"حجم نسخه پشتیبان Rich Message از حد مجاز بیشتر شد ({serialized_size} بایت)"
+        )
     return rich_message, payload
 
 
@@ -609,8 +639,6 @@ async def persist_storage(context, users=None, ai_config=None):
         message_id = bot_data.get("storage_message_id")
         if not message_id:
             raise RuntimeError("پیام اصلی ذخیره سازی گروه پیدا نشد")
-        previous_users_file_id = bot_data.get("users_file_id")
-        previous_ai_file_id = bot_data.get("ai_config_file_id")
         previous_authorized_users = bot_data.get("authorized_users")
         previous_ai_config = bot_data.get("ai_config")
         try:
@@ -629,10 +657,8 @@ async def persist_storage(context, users=None, ai_config=None):
                 "rich_message": rich_message,
             })
             bot_data["rich_storage_sha256"] = digest
-            print("Telegram Rich Message storage updated", flush=True)
+            print("Telegram plain-text Rich Message storage updated", flush=True)
         except Exception:
-            bot_data["users_file_id"] = previous_users_file_id
-            bot_data["ai_config_file_id"] = previous_ai_file_id
             if previous_authorized_users is not None:
                 bot_data["authorized_users"] = previous_authorized_users
             if previous_ai_config is not None:
@@ -1011,26 +1037,15 @@ async def initialize_access_storage(application):
         application.bot_data["ai_config"] = ai_config
 
         await ensure_storage_topics(application, saved_topics)
-        settings_thread_id = application.bot_data["storage_topics"]["تنظیمات"]
-
-        # Older versions pinned the storage index in General. Move that bot-owned
-        # record into the Settings topic so General stays free of bot storage.
+        # Keep the main backup in General so it is visible as soon as the group opens.
+        # If an older backup is pinned inside a forum topic, create a new General copy.
         if (
             pinned
             and application.bot_data.get("storage_message_id")
-            and getattr(pinned, "message_thread_id", None) != settings_thread_id
+            and getattr(pinned, "message_thread_id", None) is not None
         ):
-            try:
-                await application.bot.delete_message(
-                    chat_id=ACCESS_CHANNEL_ID,
-                    message_id=pinned.message_id,
-                )
-            except Exception as error:
-                raise RuntimeError(
-                    "پیام ذخیره سازی قدیمی هنوز در General است و حذف آن ممکن نشد؛ "
-                    "برای جلوگیری از ادامه ذخیره سازی در General راه اندازی متوقف شد"
-                ) from error
             application.bot_data.pop("storage_message_id", None)
+            application.bot_data["rich_storage_sha256"] = None
 
         payload = {
             "users_file_id": users_file_id,
@@ -1045,7 +1060,6 @@ async def initialize_access_storage(application):
         if not storage_message_id:
             message = await application.bot.send_message(
                 chat_id=ACCESS_CHANNEL_ID,
-                message_thread_id=settings_thread_id,
                 text=desired_text,
                 disable_notification=True,
             )
