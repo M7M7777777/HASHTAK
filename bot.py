@@ -29,7 +29,7 @@ from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.7"
+VERSION = "3.3.8"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -371,6 +371,26 @@ async def ensure_storage_topics(application, saved_topics=None):
             disable_notification=True,
         )
     application.bot_data["storage_topics"] = topics
+
+    display_names = {
+        "تنظیمات": "⚙️ تنظیمات",
+        "کاربران": "👥 کاربران",
+        "منابع": "📚 منابع",
+        "شمارنده ها": "🔢 شمارنده ها",
+        "حلقه ها": "🔁 حلقه ها",
+        "پشتیبان": "💾 پشتیبان",
+        "آرشیو ویجت ها": "🧩 آرشیو ویجت ها",
+        "گزارش ها": "📊 گزارش ها",
+    }
+    for key, display_name in display_names.items():
+        thread_id = topics.get(key)
+        if not thread_id:
+            continue
+        await application.bot.edit_forum_topic(
+            chat_id=ACCESS_CHANNEL_ID,
+            message_thread_id=thread_id,
+            name=display_name,
+        )
     return topics
 
 
@@ -675,7 +695,7 @@ async def create_numbered_topic(application, chat_id):
     number = state["next_number"]
     topic = await application.bot.create_forum_topic(
         chat_id=chat_id,
-        name=f"تاپیک شماره ({number:04d})",
+        name=f"🔢 تاپیک شماره ({number:04d})",
     )
     await application.bot.send_message(
         chat_id=chat_id,
