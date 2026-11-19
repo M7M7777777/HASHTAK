@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "12"
+VERSION = "13"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -437,6 +437,8 @@ async def telegram_storage_call(method, *args, **kwargs):
                 flush=True,
             )
             await asyncio.sleep(delay)
+        except BadRequest:
+            raise
         except (TimedOut, NetworkError) as error:
             if network_attempt >= 2:
                 raise
@@ -821,6 +823,8 @@ async def ensure_storage_topics(application, saved_topics=None):
         thread_id = topics.get(key)
         if not thread_id:
             continue
+        if isinstance(saved_topics, dict) and saved_topics.get(key) == thread_id:
+            continue
         try:
             await telegram_storage_call(application.bot.edit_forum_topic,
                 chat_id=ACCESS_CHANNEL_ID,
@@ -1153,7 +1157,8 @@ async def initialize_access_storage(application):
             print(f"WIDGET ARCHIVE LOAD FAILED: {application.bot_data['widget_archive_error']}", flush=True)
 
         await resume_topic_loops(application)
-        await persist_runtime_state(application)
+        if not application.bot_data.get("rich_storage_sha256"):
+            await persist_runtime_state(application)
         application.create_task(runtime_snapshot_worker(application), name="telegram-runtime-snapshot")
         print(
             f"Telegram storage ready in group {ACCESS_CHANNEL_ID}: users={len(users)}, "
