@@ -546,6 +546,29 @@ def decode_rich_storage_payload(encoded):
     return payload
 
 
+def rich_storage_uses_legacy_encryption(message):
+    if not isinstance(message, dict):
+        return False
+    rich = message.get("rich_message")
+    if not isinstance(rich, dict):
+        return False
+
+    def walk(blocks):
+        if not isinstance(blocks, list):
+            return False
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.startswith("HSTK-RICH-1:"):
+                return True
+            if walk(block.get("blocks")):
+                return True
+        return False
+
+    return walk(rich.get("blocks"))
+
+
 def extract_rich_storage_payload(message):
     if not isinstance(message, dict):
         return None
@@ -936,7 +959,10 @@ async def initialize_access_storage(application):
                 application.bot_data["storage_readable_message_ids"] = rich_storage.get("storage_readable_message_ids", {})
                 application.bot_data["storage_message_id"] = pinned.message_id
                 application.bot_data["rich_runtime_snapshot"] = rich_runtime
-                application.bot_data["rich_storage_sha256"] = _rich_storage_digest(rich_saved)
+                application.bot_data["rich_storage_sha256"] = (
+                    None if rich_storage_uses_legacy_encryption(raw_pinned)
+                    else _rich_storage_digest(rich_saved)
+                )
             elif not pinned_text:
                 raise RuntimeError("پیام پین شده متن قابل خواندن ندارد و داده Rich Message هم دریافت نشد؛ برای جلوگیری از بازنویسی اطلاعات، راه اندازی متوقف شد")
 
