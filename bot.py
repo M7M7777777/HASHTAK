@@ -2926,7 +2926,10 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or (
             update.effective_chat
             and update.effective_chat.type in ("group", "supergroup")
-            and re.fullmatch(r"[0-9۰-۹٠-٩]+\s*ثانیه", raw_msg_text)
+            and re.fullmatch(
+                r"(?:شرووع(?:\s+[0-9۰-۹٠-٩]+)?|توقف|[0-9۰-۹٠-٩]+\s*ثانیه)",
+                raw_msg_text,
+            )
         )
     ):
         return
