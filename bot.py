@@ -204,14 +204,20 @@ def decrypt_marked_payload(message_text):
 PLAIN_STORAGE_MARKER = "TELEGRAM_JOURNAL_STORAGE_PLAIN_V1"
 
 def validate_storage_payload(data):
-    if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+    if not isinstance(data, dict):
         raise ValueError("ساختار اطلاعات ذخیره شده معتبر نیست")
-    if not isinstance(data.get("ai_config"), dict):
-        raise ValueError("تنظیمات هوش مصنوعی معتبر نیست")
-    if not isinstance(data["ai_config"].get("services"), dict):
-        raise ValueError("فهرست سرویس های هوش مصنوعی معتبر نیست")
-    if data.get("widget_index_file_id") is not None and not isinstance(data.get("widget_index_file_id"), str):
-        raise ValueError("شناسه آرشیو ویجت معتبر نیست")
+    if "users" in data and not isinstance(data.get("users"), list):
+        raise ValueError("فهرست کاربران معتبر نیست")
+    if "ai_config" in data:
+        if not isinstance(data.get("ai_config"), dict):
+            raise ValueError("تنظیمات هوش مصنوعی معتبر نیست")
+        if not isinstance(data["ai_config"].get("services"), dict):
+            raise ValueError("فهرست سرویس های هوش مصنوعی معتبر نیست")
+    for key in ("widget_index_file_id", "runtime_snapshot_file_id", "users_file_id", "ai_config_file_id"):
+        if data.get(key) is not None and not isinstance(data.get(key), str):
+            raise ValueError(f"شناسه فایل ذخیره سازی {key} معتبر نیست")
+    if "topics" in data and not isinstance(data.get("topics"), dict):
+        raise ValueError("فهرست تاپیک های ذخیره سازی معتبر نیست")
     return data
 
 def plain_storage_text(payload):
@@ -230,8 +236,8 @@ def parse_plain_storage(message_text):
 def storage_message_text(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
     data = {
-        "users": sorted(bot_data.get("authorized_users", set()) if users is None else users),
-        "ai_config": bot_data.get("ai_config", {"services": {}, "default_service": None}) if ai_config is None else ai_config,
+        "users_file_id": bot_data.get("users_file_id"),
+        "ai_config_file_id": bot_data.get("ai_config_file_id"),
         "widget_index_file_id": bot_data.get("widget_index_file_id"),
         "runtime_snapshot_file_id": bot_data.get("runtime_snapshot_file_id"),
         "topics": bot_data.get("storage_topics", {}),
@@ -246,12 +252,39 @@ async def persist_storage(context, users=None, ai_config=None):
         message_id = bot_data.get("storage_message_id")
         if not message_id:
             raise RuntimeError("پیام اصلی ذخیره سازی گروه پیدا نشد")
-        text = storage_message_text(context, users, ai_config)
-        await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
-        if users is not None:
-            bot_data["authorized_users"] = set(users)
-        if ai_config is not None:
-            bot_data["ai_config"] = ai_config
+        previous_users_file_id = bot_data.get("users_file_id")
+        previous_ai_file_id = bot_data.get("ai_config_file_id")
+        try:
+            if users is not None:
+                users_raw = json.dumps(sorted(users), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                archived_users = await context.bot.send_document(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_thread_id=(bot_data.get("storage_topics") or {}).get("کاربران"),
+                    document=InputFile(io.BytesIO(users_raw), filename="authorized-users.json"),
+                    caption="فهرست کاربران مجاز · JSON بدون رمزنگاری",
+                    disable_notification=True,
+                )
+                bot_data["users_file_id"] = archived_users.document.file_id
+            if ai_config is not None:
+                ai_raw = json.dumps(ai_config, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+                archived_ai = await context.bot.send_document(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_thread_id=(bot_data.get("storage_topics") or {}).get("تنظیمات"),
+                    document=InputFile(io.BytesIO(ai_raw), filename="ai-config.json"),
+                    caption="تنظیمات و کلیدهای API · متن ساده و بدون رمزنگاری",
+                    disable_notification=True,
+                )
+                bot_data["ai_config_file_id"] = archived_ai.document.file_id
+            text = storage_message_text(context, users, ai_config)
+            await context.bot.edit_message_text(chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
+            if users is not None:
+                bot_data["authorized_users"] = set(users)
+            if ai_config is not None:
+                bot_data["ai_config"] = ai_config
+        except Exception:
+            bot_data["users_file_id"] = previous_users_file_id
+            bot_data["ai_config_file_id"] = previous_ai_file_id
+            raise
 
 
 async def persist_ai_config(config, context):
