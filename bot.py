@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "12"
+VERSION = "14"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -359,6 +359,7 @@ def readable_storage_texts(application):
                 continue
             loop_lines.append(
                 f"گروه {chat_id} | شماره بعدی: {state.get('next_number', 1)} | "
+                f"فاصله: {state.get('interval_seconds', 60)} ثانیه | "
                 f"وضعیت: {'فعال' if state.get('active') else 'متوقف'}"
             )
     else:
@@ -437,6 +438,8 @@ async def telegram_storage_call(method, *args, **kwargs):
                 flush=True,
             )
             await asyncio.sleep(delay)
+        except BadRequest:
+            raise
         except (TimedOut, NetworkError) as error:
             if network_attempt >= 2:
                 raise
@@ -820,6 +823,8 @@ async def ensure_storage_topics(application, saved_topics=None):
     for key, display_name in display_names.items():
         thread_id = topics.get(key)
         if not thread_id:
+            continue
+        if isinstance(saved_topics, dict) and saved_topics.get(key) == thread_id:
             continue
         try:
             await telegram_storage_call(application.bot.edit_forum_topic,
@@ -1223,8 +1228,15 @@ def load_topic_loop_states():
             continue
         next_number = state.get("next_number", 1)
         active = state.get("active", False)
+        interval_seconds = state.get("interval_seconds", 60)
+        if not isinstance(interval_seconds, int) or interval_seconds < 1:
+            interval_seconds = 60
         if isinstance(next_number, int) and next_number > 0 and isinstance(active, bool):
-            normalized = {"next_number": next_number, "active": active}
+            normalized = {
+                "next_number": next_number,
+                "active": active,
+                "interval_seconds": interval_seconds,
+            }
             pending_number = state.get("pending_number")
             if isinstance(pending_number, int) and pending_number > 0:
                 normalized["pending_number"] = pending_number
@@ -1253,15 +1265,31 @@ async def create_numbered_topic(application, chat_id):
         # times out after Telegram created the topic, a restart won't duplicate it.
         state["pending_number"] = number
         save_topic_loop_states(states)
-        try:
-            topic = await application.bot.create_forum_topic(
-                chat_id=chat_id,
-                name=f"تاپیک شماره ({number})",
-            )
-        except Exception:
-            state["active"] = False
-            save_topic_loop_states(states)
-            raise
+        while True:
+            try:
+                topic = await application.bot.create_forum_topic(
+                    chat_id=chat_id,
+                    name=f"تاپیک شماره ({number})",
+                )
+                break
+            except RetryAfter as error:
+                retry_after = getattr(error, "retry_after", 1)
+                if hasattr(retry_after, "total_seconds"):
+                    retry_after = retry_after.total_seconds()
+                delay = max(1.0, float(retry_after)) + 1.0
+                print(
+                    f"TOPIC CREATION RATE LIMIT chat_id={chat_id}: waiting {delay:.1f}s before retry",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+                if not state.get("active"):
+                    state.pop("pending_number", None)
+                    save_topic_loop_states(states)
+                    return None
+            except Exception:
+                state["active"] = False
+                save_topic_loop_states(states)
+                raise
 
         # Advance immediately after Telegram confirms topic creation. A later
         # failure while sending the timestamp must never recreate the same topic.
@@ -1288,7 +1316,10 @@ async def create_numbered_topic(application, chat_id):
 async def topic_loop_worker(application, chat_id):
     key = str(chat_id)
     while application.bot_data["topic_loop_states"].get(key, {}).get("active"):
-        await asyncio.sleep(60)
+        interval = application.bot_data["topic_loop_states"].get(key, {}).get("interval_seconds", 60)
+        if not isinstance(interval, int) or interval < 1:
+            interval = 60
+        await asyncio.sleep(interval)
         if not application.bot_data["topic_loop_states"].get(key, {}).get("active"):
             break
         try:
@@ -1355,14 +1386,24 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat = update.effective_chat
     user = update.effective_user
     command = (message.text or "").strip()
-    match = re.fullmatch(r"شرووع(?:\s+([0-9۰-۹٠-٩]+))?|توقف", command)
+    match = re.fullmatch(
+        r"شرووع(?:\s+([0-9۰-۹٠-٩]+))?|توقف|([0-9۰-۹٠-٩]+)\s*ثانیه",
+        command,
+    )
     if not match:
         return
-    requested_number = match.group(1) if command.startswith("شرووع") else None
+    digits_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    requested_number = match.group(1)
+    requested_seconds = match.group(2)
     if requested_number:
-        requested_number = int(requested_number.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")))
+        requested_number = int(requested_number.translate(digits_map))
         if requested_number < 1:
             await message.reply_text("شماره باید بزرگتر از صفر باشه.")
+            raise ApplicationHandlerStop
+    if requested_seconds is not None:
+        requested_seconds = int(requested_seconds.translate(digits_map))
+        if requested_seconds < 1:
+            await message.reply_text("عدد ثانیه باید از 1 به بالا باشه.")
             raise ApplicationHandlerStop
 
     if not chat or chat.type not in ("group", "supergroup"):
@@ -1370,10 +1411,11 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         raise ApplicationHandlerStop
 
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status not in ("administrator", "creator"):
-            await message.reply_text("⛔ فقط مدیران گروه می توانند از این دستور استفاده کنند.")
-            raise ApplicationHandlerStop
+        if requested_seconds is None:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            if member.status not in ("administrator", "creator"):
+                await message.reply_text("⛔ فقط مدیران گروه می توانند از این دستور استفاده کنند.")
+                raise ApplicationHandlerStop
 
         bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
         if bot_member.status != "administrator" or not getattr(bot_member, "can_manage_topics", False):
@@ -1389,8 +1431,55 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         tasks = context.application.bot_data.setdefault("topic_loop_tasks", {})
         key = str(chat.id)
 
-        if command.startswith("شرووع"):
-            state = states.setdefault(key, {"next_number": 1, "active": False})
+        if requested_seconds is not None:
+            state = states.setdefault(key, {"next_number": 1, "active": False, "interval_seconds": requested_seconds})
+            state["interval_seconds"] = requested_seconds
+            was_active = bool(state.get("active"))
+            if state.get("pending_number") is not None and not was_active:
+                save_topic_loop_states(states)
+                await persist_runtime_state(context.application)
+                await message.reply_text(
+                    f"⏱ فاصله زمانی روی {requested_seconds} ثانیه تنظیم شد، اما نتیجه تلاش قبلی برای ساخت "
+                    f"تاپیک شماره {state['pending_number']} مشخص نیست. اول گروه رو بررسی کن و بعد با دستور "
+                    "«شرووع عدد» ادامه بده."
+                )
+                raise ApplicationHandlerStop
+
+            task = tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+
+            state["active"] = True
+            save_topic_loop_states(states)
+            await persist_runtime_state(context.application)
+
+            if not was_active:
+                try:
+                    await create_numbered_topic(context.application, chat.id)
+                except Exception:
+                    state["active"] = False
+                    save_topic_loop_states(states)
+                    try:
+                        await persist_runtime_state(context.application)
+                    except Exception as rollback_error:
+                        print(
+                            f"TOPIC LOOP ROLLBACK PERSIST FAILED: {type(rollback_error).__name__}: {rollback_error}",
+                            flush=True,
+                        )
+                    raise
+
+            task = context.application.create_task(
+                topic_loop_worker(context.application, chat.id),
+                name=f"topic-loop-{key}",
+            )
+            tasks[key] = task
+            if was_active:
+                await message.reply_text(f"⏱ فاصله ساخت تاپیک ها به هر {requested_seconds} ثانیه تغییر کرد.")
+            else:
+                await message.reply_text(f"✅ ساخت تاپیک ها شروع شد. هر {requested_seconds} ثانیه یک تاپیک جدید ساخته میشه.")
+        elif command.startswith("شرووع"):
+            state = states.setdefault(key, {"next_number": 1, "active": False, "interval_seconds": 60})
+            state.setdefault("interval_seconds", 60)
             if state.get("pending_number") is not None and requested_number is None:
                 await message.reply_text(
                     f"⚠️ نتیجه تلاش قبلی برای ساخت تاپیک شماره {state['pending_number']} مشخص نیست. "
@@ -1425,7 +1514,8 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 name=f"topic-loop-{key}",
             )
             tasks[key] = task
-            await message.reply_text("✅ ساخت تاپیک ها شروع شد. هر ۱ دقیقه یک تاپیک جدید ساخته میشه.")
+            interval = state.get("interval_seconds", 60)
+            await message.reply_text(f"✅ ساخت تاپیک ها شروع شد. هر {interval} ثانیه یک تاپیک جدید ساخته میشه.")
         else:
             state = states.get(key)
             if not state or not state.get("active"):
@@ -2770,10 +2860,18 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message and any(getattr(message, field, None) for field in service_fields):
         return
 
-    # Anyone may request their own numeric ID so the owner can grant access.
-    message_parts = (update.message.text or "").split(maxsplit=1) if update.message else []
-    if (message_parts and message_parts[0].split("@", 1)[0] in ("/myid", "/start")) or (
-        update.message and (update.message.text or "").strip() == "م"
+    # Anyone may request their own numeric ID so the owner can grant access,
+    # or set the topic creation interval in a group with "<number> ثانیه".
+    raw_msg_text = (update.message.text or "").strip() if update.message else ""
+    message_parts = raw_msg_text.split(maxsplit=1) if raw_msg_text else []
+    if (
+        (message_parts and message_parts[0].split("@", 1)[0] in ("/myid", "/start"))
+        or raw_msg_text == "م"
+        or (
+            update.effective_chat
+            and update.effective_chat.type in ("group", "supergroup")
+            and re.fullmatch(r"[0-9۰-۹٠-٩]+\s*ثانیه", raw_msg_text)
+        )
     ):
         return
 
@@ -6696,7 +6794,7 @@ app.add_handler(MessageHandler(
     filters.VOICE | filters.Document.ALL,
     media_router,
 ))
-app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*(?:شرووع(?:\s+[0-9۰-۹٠-٩]+)?|توقف)\s*$"), topic_loop_command), group=0)
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*(?:شرووع(?:\s+[0-9۰-۹٠-٩]+)?|توقف|[0-9۰-۹٠-٩]+\s*ثانیه)\s*$"), topic_loop_command), group=0)
 app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*م\s*$"), widget_menu_start), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, widget_text), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text), group=1)
