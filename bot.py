@@ -525,7 +525,12 @@ def decode_rich_storage_payload(encoded):
     expected_tag = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext, hashlib.sha256).digest()
     if not hmac.compare_digest(supplied_tag, expected_tag):
         raise ValueError("اعتبارسنجی داده پشتیبان Rich Message ناموفق بود")
-    payload = ast.literal_eval(zlib.decompress(ai_xor_stream(ciphertext, encryption_key, nonce)).decode("utf-8"))
+    decoded = zlib.decompress(ai_xor_stream(ciphertext, encryption_key, nonce)).decode("utf-8")
+    try:
+        payload = ast.literal_eval(decoded)
+    except (SyntaxError, ValueError):
+        # Read the short-lived JSON-encoded Rich Message format during migration.
+        payload = json.loads(decoded)
     if not isinstance(payload, dict) or payload.get("version") != 1:
         raise ValueError("نسخه داده پشتیبان Rich Message معتبر نیست")
     return payload
