@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "15"
+VERSION = "16"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -945,6 +945,40 @@ async def runtime_snapshot_worker(application):
             print(f"TELEGRAM RUNTIME BACKUP FAILED: {type(error).__name__}: {error}", flush=True)
 
 
+def create_application_task(application, coroutine, name):
+    """Create a task safely both before and after Application.start()."""
+    if application.running:
+        return application.create_task(coroutine, name=name)
+
+    task = asyncio.create_task(coroutine, name=name)
+    startup_tasks = application.bot_data.setdefault("_startup_tasks", set())
+    startup_tasks.add(task)
+
+    def report_startup_task_result(done_task):
+        startup_tasks.discard(done_task)
+        if done_task.cancelled():
+            return
+        error = done_task.exception()
+        if error is not None:
+            print(
+                f"STARTUP BACKGROUND TASK FAILED ({name}): "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+
+    task.add_done_callback(report_startup_task_result)
+    return task
+
+
+async def start_background_storage_init(application):
+    print("BOT POLLING STARTING; scheduling background Telegram storage sync...", flush=True)
+    create_application_task(
+        application,
+        initialize_access_storage(application),
+        name="telegram-initial-storage-sync",
+    )
+
+
 async def initialize_access_storage(application):
     try:
         chat = await telegram_storage_call(application.bot.get_chat, ACCESS_CHANNEL_ID)
@@ -1159,7 +1193,7 @@ async def initialize_access_storage(application):
 
         await resume_topic_loops(application)
         await persist_runtime_state(application)
-        application.create_task(runtime_snapshot_worker(application), name="telegram-runtime-snapshot")
+        create_application_task(application, runtime_snapshot_worker(application), name="telegram-runtime-snapshot")
         print(
             f"Telegram storage ready in group {ACCESS_CHANNEL_ID}: users={len(users)}, "
             f"runtime_snapshot={bool(runtime_snapshot_file_id)}, topics={len(application.bot_data['storage_topics'])}",
@@ -1190,7 +1224,8 @@ async def initialize_access_storage(application):
         )
         if not application.bot_data.get("access_storage_retry_scheduled"):
             application.bot_data["access_storage_retry_scheduled"] = True
-            application.create_task(
+            create_application_task(
+                application,
                 access_storage_retry_worker(application),
                 name="telegram-access-storage-retry",
             )
@@ -1377,7 +1412,8 @@ async def resume_topic_loops(application):
     application.bot_data["topic_loop_tasks"] = {}
     for key, state in states.items():
         if state.get("active"):
-            task = application.create_task(
+            task = create_application_task(
+                application,
                 topic_loop_worker(application, int(key)),
                 name=f"topic-loop-{key}",
             )
@@ -1414,11 +1450,10 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         raise ApplicationHandlerStop
 
     try:
-        if requested_seconds is None:
-            member = await context.bot.get_chat_member(chat.id, user.id)
-            if member.status not in ("administrator", "creator"):
-                await message.reply_text("⛔ فقط مدیران گروه می توانند از این دستور استفاده کنند.")
-                raise ApplicationHandlerStop
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await message.reply_text("⛔ فقط مدیران گروه می توانند از این دستور استفاده کنند.")
+            raise ApplicationHandlerStop
 
         bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
         if bot_member.status != "administrator" or not getattr(bot_member, "can_manage_topics", False):
@@ -6795,12 +6830,6 @@ except Exception:
     app.bot_data["topic_loop_states"] = {}
 
 
-async def start_background_storage_init(application):
-    print("BOT POLLING STARTING; scheduling background Telegram storage sync...", flush=True)
-    application.create_task(
-        initialize_access_storage(application),
-        name="telegram-initial-storage-sync",
-    )
 # Activity auditing is intentionally disabled. No user messages or button clicks
 # are copied into the support/storage group.
 # Group -1 checks every update before the bot's normal handlers.
