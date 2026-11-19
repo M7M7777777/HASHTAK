@@ -988,7 +988,7 @@ async def stop_startup_tasks(application):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def initialize_access_storage(application):
+async def _initialize_access_storage(application):
     try:
         chat = await telegram_storage_call(application.bot.get_chat, ACCESS_CHANNEL_ID)
         pinned = chat.pinned_message
@@ -1240,6 +1240,17 @@ async def initialize_access_storage(application):
             )
 
 
+async def initialize_access_storage(application):
+    if application.bot_data.get("access_channel_ready"):
+        return True
+    lock = application.bot_data.setdefault("access_init_lock", asyncio.Lock())
+    async with lock:
+        if application.bot_data.get("access_channel_ready"):
+            return True
+        await _initialize_access_storage(application)
+        return bool(application.bot_data.get("access_channel_ready"))
+
+
 async def access_storage_retry_worker(application):
     try:
         while not application.bot_data.get("access_channel_ready"):
@@ -1252,14 +1263,7 @@ async def access_storage_retry_worker(application):
 
 
 async def ensure_access_storage_ready(application):
-    if application.bot_data.get("access_channel_ready"):
-        return True
-    lock = application.bot_data.setdefault("access_init_lock", asyncio.Lock())
-    async with lock:
-        if application.bot_data.get("access_channel_ready"):
-            return True
-        await initialize_access_storage(application)
-        return bool(application.bot_data.get("access_channel_ready"))
+    return await initialize_access_storage(application)
 
 
 def load_topic_loop_states():
