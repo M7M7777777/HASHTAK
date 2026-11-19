@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "10"
+VERSION = "11"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -417,22 +417,37 @@ def readable_storage_texts(application):
 
 
 async def telegram_storage_call(method, *args, **kwargs):
-    """Retry Telegram storage requests after server-side flood-control delays."""
-    for attempt in range(6):
+    """Retry transient Telegram storage failures without discarding local state."""
+    network_attempt = 0
+    rate_limit_attempt = 0
+    while True:
         try:
             return await method(*args, **kwargs)
         except RetryAfter as error:
+            if rate_limit_attempt >= 5:
+                raise
             retry_after = getattr(error, "retry_after", 1)
             if hasattr(retry_after, "total_seconds"):
                 retry_after = retry_after.total_seconds()
             delay = max(1.0, float(retry_after)) + 1.0
+            rate_limit_attempt += 1
             print(
                 f"TELEGRAM STORAGE RATE LIMIT: waiting {delay:.1f}s "
-                f"before retry {attempt + 1}/5",
+                f"before retry {rate_limit_attempt}/5",
                 flush=True,
             )
             await asyncio.sleep(delay)
-    raise RuntimeError("Telegram storage request exceeded the retry limit")
+        except (TimedOut, NetworkError) as error:
+            if network_attempt >= 2:
+                raise
+            delay = 2 ** (network_attempt + 1)
+            network_attempt += 1
+            print(
+                f"TELEGRAM STORAGE NETWORK RETRY: {type(error).__name__}; "
+                f"waiting {delay}s before retry {network_attempt}/2",
+                flush=True,
+            )
+            await asyncio.sleep(delay)
 
 
 async def sync_readable_storage_topics(context):
@@ -1142,12 +1157,26 @@ async def initialize_access_storage(application):
         if legacy_decryption_failed:
             print("WARNING: legacy storage could not be fully imported; old group remains untouched.", flush=True)
     except Exception as error:
-        application.bot_data["authorized_users"] = set()
-        application.bot_data["ai_config"] = {"services": {}, "default_service": None}
+        # A Telegram storage outage must not erase the locally cached access list.
+        # The local JSON file is the last-known-good fallback when the group is unreachable.
+        try:
+            local_users = load_access_users()
+        except Exception as local_error:
+            local_users = set()
+            print(
+                f"LOCAL ACCESS FALLBACK UNAVAILABLE: {type(local_error).__name__}: {local_error}",
+                flush=True,
+            )
+        application.bot_data["authorized_users"] = local_users
+        application.bot_data.setdefault("ai_config", ai_default_config())
         application.bot_data["access_channel_ready"] = False
         startup_error = f"{type(error).__name__}: {error}"
         application.bot_data["access_storage_error"] = startup_error
-        print(f"CRITICAL: Telegram group storage unavailable; refusing to overwrite stored data: {startup_error}", flush=True)
+        print(
+            "CRITICAL: Telegram group storage unavailable; keeping local access data "
+            f"and refusing to overwrite stored data: {startup_error}",
+            flush=True,
+        )
 
 
 def load_topic_loop_states():
@@ -6590,6 +6619,7 @@ telegram_request = HTTPXRequest(
     write_timeout=120.0,
     pool_timeout=30.0,
     media_write_timeout=180.0,
+    http_version="1.1",
 )
 telegram_updates_request = HTTPXRequest(
     connection_pool_size=8,
@@ -6597,6 +6627,7 @@ telegram_updates_request = HTTPXRequest(
     read_timeout=60.0,
     write_timeout=30.0,
     pool_timeout=30.0,
+    http_version="1.1",
 )
 app = (
     Application.builder()
