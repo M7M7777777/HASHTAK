@@ -503,6 +503,16 @@ async def resume_topic_loops(application):
             flush=True,
         )
         states = {}
+    # Preserve the user's confirmed sequence in the new private storage group.
+    storage_group_key = str(ACCESS_CHANNEL_ID)
+    storage_group_state = states.setdefault(
+        storage_group_key, {"next_number": 1096, "active": False}
+    )
+    storage_group_state["next_number"] = max(
+        int(storage_group_state.get("next_number", 1096)), 1096
+    )
+    save_topic_loop_states(states)
+
     application.bot_data["topic_loop_states"] = states
     application.bot_data["topic_loop_tasks"] = {}
     for key, state in states.items():
