@@ -682,11 +682,13 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 states[key] = {"next_number": 1, "active": False}
             states[key]["active"] = True
             save_topic_loop_states(states)
+            await persist_runtime_state(context.application)
             try:
                 await create_numbered_topic(context.application, chat.id)
             except Exception:
                 states[key]["active"] = False
                 save_topic_loop_states(states)
+                await persist_runtime_state(context.application)
                 raise
             task = context.application.create_task(
                 topic_loop_worker(context.application, chat.id),
@@ -701,6 +703,7 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 raise ApplicationHandlerStop
             state["active"] = False
             save_topic_loop_states(states)
+            await persist_runtime_state(context.application)
             task = tasks.pop(key, None)
             if task and not task.done():
                 task.cancel()
@@ -3916,7 +3919,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.pop("pending", None)
         context.user_data.pop("connector_key_target", None)
-        await update.message.reply_text("✅ کلید به صورت رمزگذاری شده در تنظیمات ذخیره شد" if secret_value != "-" else "✅ کلید اتصال پاک شد", reply_markup=connector_menu(config))
+        await update.message.reply_text("✅ کلید به صورت متن ساده در گروه ذخیره شد" if secret_value != "-" else "✅ کلید اتصال پاک شد", reply_markup=connector_menu(config))
         return
 
     if key == "connector_url":
