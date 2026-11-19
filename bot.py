@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import copy
 import gzip
 import html as html_lib
@@ -30,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "02"
+VERSION = "06"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -553,8 +554,16 @@ async def load_widget_index(application, file_id):
         return
     remote = await application.bot.get_file(file_id)
     content = await remote.download_as_bytearray()
-    raw = gzip.decompress(bytes(content))
-    index = json.loads(raw.decode("utf-8"))
+    downloaded = bytes(content)
+    try:
+        # New archives are UTF-8 text containing a Python literal structure.
+        index = ast.literal_eval(downloaded.decode("utf-8"))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        # Backward compatibility with old JSON.GZ widget indexes.
+        try:
+            index = json.loads(gzip.decompress(downloaded).decode("utf-8"))
+        except Exception:
+            index = json.loads(downloaded.decode("utf-8"))
     if (
         not isinstance(index, dict)
         or index.get("version") != 1
@@ -567,13 +576,12 @@ async def load_widget_index(application, file_id):
 async def save_widget_index(context):
     bot_data = context.application.bot_data
     index = bot_data.get("widget_index") or empty_widget_index()
-    raw = json.dumps(index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    packed = gzip.compress(raw, compresslevel=6)
+    raw = repr(index).encode("utf-8")
     archived = await telegram_storage_call(context.bot.send_document,
         chat_id=ACCESS_CHANNEL_ID,
         message_thread_id=(bot_data.get("storage_topics") or {}).get("آرشیو ویجت ها"),
-        document=InputFile(io.BytesIO(packed), filename="widget-index.json.gz"),
-        caption="Telegram Journal · Widget archive index",
+        document=InputFile(io.BytesIO(raw), filename="widget-index.txt"),
+        caption="فهرست آرشیو ویجت ها · متن ساده",
         disable_notification=True,
     )
     # Upload first, then move the plain-text root pointer. An interrupted update
@@ -619,7 +627,7 @@ async def ensure_storage_topics(application, saved_topics=None):
         await telegram_storage_call(application.bot.send_message,
             chat_id=ACCESS_CHANNEL_ID,
             message_thread_id=created.message_thread_id,
-            text=f"📁 بخش ذخیره سازی: {name}\nاطلاعات این بخش به صورت متن ساده یا فایل JSON نگهداری می شود.",
+            text=f"📁 بخش ذخیره سازی: {name}\nاطلاعات این بخش به صورت متن نگهداری می شود.",
             disable_notification=True,
         )
     application.bot_data["storage_topics"] = topics
@@ -660,7 +668,11 @@ async def restore_runtime_state(application, file_id):
         return False
     remote = await application.bot.get_file(file_id)
     raw = bytes(await remote.download_as_bytearray())
-    snapshot = json.loads(raw.decode("utf-8"))
+    try:
+        snapshot = ast.literal_eval(raw.decode("utf-8"))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        # Read backups created by older versions during migration.
+        snapshot = json.loads(raw.decode("utf-8"))
     application.bot_data["runtime_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
     if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
         raise ValueError("ساختار نسخه پشتیبان تلگرام معتبر نیست")
@@ -722,7 +734,7 @@ async def persist_runtime_state(application):
             "ai_config": bot_data.get("ai_config") or ai_default_config(),
             "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
         }
-        raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        raw = repr(snapshot).encode("utf-8")
         snapshot_hash = hashlib.sha256(raw).hexdigest()
         if snapshot_hash == bot_data.get("runtime_snapshot_sha256"):
             return
@@ -730,8 +742,8 @@ async def persist_runtime_state(application):
         archived = await telegram_storage_call(application.bot.send_document,
             chat_id=ACCESS_CHANNEL_ID,
             message_thread_id=thread_id,
-            document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.json"),
-            caption="پشتیبان کامل وضعیت ربات · JSON بدون رمزنگاری",
+            document=InputFile(io.BytesIO(raw), filename="hashtak-runtime-backup.txt"),
+            caption="پشتیبان کامل وضعیت ربات · فایل متنی UTF-8",
             disable_notification=True,
         )
         previous_id = bot_data.get("runtime_snapshot_file_id")
@@ -871,6 +883,27 @@ async def initialize_access_storage(application):
         application.bot_data["ai_config"] = ai_config
 
         await ensure_storage_topics(application, saved_topics)
+        settings_thread_id = application.bot_data["storage_topics"]["تنظیمات"]
+
+        # Older versions pinned the storage index in General. Move that bot-owned
+        # record into the Settings topic so General stays free of bot storage.
+        if (
+            pinned
+            and application.bot_data.get("storage_message_id")
+            and getattr(pinned, "message_thread_id", None) != settings_thread_id
+        ):
+            try:
+                await application.bot.delete_message(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_id=pinned.message_id,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    "پیام ذخیره سازی قدیمی هنوز در General است و حذف آن ممکن نشد؛ "
+                    "برای جلوگیری از ادامه ذخیره سازی در General راه اندازی متوقف شد"
+                ) from error
+            application.bot_data.pop("storage_message_id", None)
+
         payload = {
             "users_file_id": users_file_id,
             "ai_config_file_id": ai_config_file_id,
@@ -879,10 +912,13 @@ async def initialize_access_storage(application):
             "runtime_snapshot_sha256": runtime_snapshot_sha256,
             "topics": application.bot_data["storage_topics"],
         }
-        if not application.bot_data.get("storage_message_id"):
+        desired_text = plain_storage_text(payload)
+        storage_message_id = application.bot_data.get("storage_message_id")
+        if not storage_message_id:
             message = await application.bot.send_message(
                 chat_id=ACCESS_CHANNEL_ID,
-                text=plain_storage_text(payload),
+                message_thread_id=settings_thread_id,
+                text=desired_text,
                 disable_notification=True,
             )
             await application.bot.pin_chat_message(
@@ -891,15 +927,13 @@ async def initialize_access_storage(application):
                 disable_notification=True,
             )
             application.bot_data["storage_message_id"] = message.message_id
-        else:
-            desired_text = plain_storage_text(payload)
-            if pinned_text != desired_text:
-                await safe_edit_message_text(
-                    application.bot,
-                    chat_id=ACCESS_CHANNEL_ID,
-                    message_id=application.bot_data["storage_message_id"],
-                    text=desired_text,
-                )
+        elif pinned_text != desired_text:
+            await safe_edit_message_text(
+                application.bot,
+                chat_id=ACCESS_CHANNEL_ID,
+                message_id=storage_message_id,
+                text=desired_text,
+            )
 
         application.bot_data["access_message_id"] = application.bot_data["storage_message_id"]
         application.bot_data["access_channel_ready"] = True
@@ -960,7 +994,11 @@ def load_topic_loop_states():
         next_number = state.get("next_number", 1)
         active = state.get("active", False)
         if isinstance(next_number, int) and next_number > 0 and isinstance(active, bool):
-            states[str(int(chat_id))] = {"next_number": next_number, "active": active}
+            normalized = {"next_number": next_number, "active": active}
+            pending_number = state.get("pending_number")
+            if isinstance(pending_number, int) and pending_number > 0:
+                normalized["pending_number"] = pending_number
+            states[str(int(chat_id))] = normalized
     return states
 
 
@@ -971,21 +1009,50 @@ def save_topic_loop_states(states):
 async def create_numbered_topic(application, chat_id):
     states = application.bot_data["topic_loop_states"]
     key = str(chat_id)
-    state = states.setdefault(key, {"next_number": 1, "active": False})
-    number = state["next_number"]
-    topic = await application.bot.create_forum_topic(
-        chat_id=chat_id,
-        name=f"تاپیک شماره ({number})",
-    )
-    await application.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=topic.message_thread_id,
-        text=persian_timestamp(),
-    )
-    state["next_number"] = number + 1
-    save_topic_loop_states(states)
-    if chat_id == ACCESS_CHANNEL_ID:
-        await persist_runtime_state(application)
+    locks = application.bot_data.setdefault("topic_creation_locks", {})
+    lock = locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        state = states.setdefault(key, {"next_number": 1, "active": False})
+        if state.get("pending_number") is not None:
+            raise RuntimeError(
+                f"نتیجه ساخت تاپیک شماره {state['pending_number']} نامشخص است؛ "
+                "برای جلوگیری از ساخت تکراری، حلقه متوقف شده"
+            )
+        number = int(state.get("next_number", 1))
+        # Persist an in-flight marker before calling Telegram. If the request
+        # times out after Telegram created the topic, a restart won't duplicate it.
+        state["pending_number"] = number
+        save_topic_loop_states(states)
+        try:
+            topic = await application.bot.create_forum_topic(
+                chat_id=chat_id,
+                name=f"تاپیک شماره ({number})",
+            )
+        except Exception:
+            state["active"] = False
+            save_topic_loop_states(states)
+            raise
+
+        # Advance immediately after Telegram confirms topic creation. A later
+        # failure while sending the timestamp must never recreate the same topic.
+        state["next_number"] = number + 1
+        state.pop("pending_number", None)
+        save_topic_loop_states(states)
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=topic.message_thread_id,
+                text=persian_timestamp(),
+            )
+        except Exception as error:
+            print(
+                f"TOPIC INITIAL MESSAGE FAILED chat_id={chat_id} "
+                f"thread_id={topic.message_thread_id}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+        if chat_id == ACCESS_CHANNEL_ID:
+            await persist_runtime_state(application)
+        return topic.message_thread_id
 
 
 async def topic_loop_worker(application, chat_id):
@@ -999,10 +1066,14 @@ async def topic_loop_worker(application, chat_id):
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            state = application.bot_data["topic_loop_states"].get(key, {})
+            state["active"] = False
+            save_topic_loop_states(application.bot_data["topic_loop_states"])
             print(
-                f"TOPIC LOOP ERROR chat_id={chat_id}: {type(error).__name__}: {error}",
+                f"TOPIC LOOP PAUSED chat_id={chat_id}: {type(error).__name__}: {error}",
                 flush=True,
             )
+            break
 
 
 async def resume_topic_loops(application):
@@ -1028,6 +1099,16 @@ async def resume_topic_loops(application):
     storage_group_state["active"] = False
     save_topic_loop_states(states)
 
+    for key, state in states.items():
+        if state.get("pending_number") is not None:
+            state["active"] = False
+            print(
+                f"TOPIC LOOP RECOVERY REQUIRED chat_id={key}: "
+                f"creation of topic {state['pending_number']} may have completed; "
+                "automatic retry was disabled to prevent duplicates",
+                flush=True,
+            )
+    save_topic_loop_states(states)
     application.bot_data["topic_loop_states"] = states
     application.bot_data["topic_loop_tasks"] = {}
     for key, state in states.items():
@@ -1080,8 +1161,15 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if command.startswith("شرووع"):
             state = states.setdefault(key, {"next_number": 1, "active": False})
+            if state.get("pending_number") is not None and requested_number is None:
+                await message.reply_text(
+                    f"⚠️ نتیجه تلاش قبلی برای ساخت تاپیک شماره {state['pending_number']} مشخص نیست. "
+                    "اول گروه رو بررسی کن و بعد شماره بعدی رو با دستور «شرووع عدد» مشخص کن."
+                )
+                raise ApplicationHandlerStop
             if requested_number is not None:
                 state["next_number"] = requested_number
+                state.pop("pending_number", None)
             if state.get("active"):
                 task = tasks.pop(key, None)
                 if task and not task.done():
@@ -2777,23 +2865,32 @@ def button_preview_text(button):
     names = {
         "url": "باز کردن لینک",
         "disabled": "غیرفعال",
+        "web_app": "باز کردن وب اپ",
+        "login_url": "ورود با تلگرام",
+        "copy_text": "کپی متن",
+        "callback_data": "اجرای دستور ربات",
+        "switch_inline_query": "جستجوی درون خطی",
+        "switch_inline_query_current_chat": "جستجو در همین گفتگو",
+        "switch_inline_query_chosen_chat": "انتخاب گفتگو برای جستجو",
     }
     kind = next((key for key in names if key in button), "نامشخص")
     value = ""
     if kind == "url":
-        value = button["url"]
+        value = button.get("url", "")
     elif kind in ("web_app", "login_url"):
-        value = button[kind]["url"]
+        value = (button.get(kind) or {}).get("url", "")
     elif kind == "copy_text":
-        value = button[kind]["text"]
+        value = (button.get(kind) or {}).get("text", "")
+    elif kind == "callback_data":
+        value = button.get("callback_data", "")
     elif kind.startswith("switch_inline_query"):
-        item = button[kind]
-        value = item if isinstance(item, str) else item.get("query", "")
+        item = button.get(kind)
+        value = item if isinstance(item, str) else (item or {}).get("query", "")
     style_names = {"primary": "آبی", "success": "سبز", "danger": "قرمز"}
     return (
         "👀 پیش‌نمایش دکمه\n\n"
-        f"متن دکمه: {button['text']}\n"
-        f"عملکرد: {names[kind]}"
+        f"متن دکمه: {button.get('text', 'بدون عنوان')}\n"
+        f"عملکرد: {names.get(kind, 'نامشخص')}"
         + (f"\nمقدار: {value}" if value else "")
         + f"\nظاهر دکمه: {style_names.get(button.get('style', 'primary'), button.get('style', 'primary'))}"
         + "\n\nاگه درسته ثبتش کن"
@@ -4013,14 +4110,30 @@ def wallex_tmn_price(asset, markets, usdt_tmn=None):
         graph.setdefault(base, []).append((quote_asset, price))
         graph.setdefault(quote_asset, []).append((base, Decimal("1") / price))
 
-    # Breadth-first search finds a conversion route to Toman.
+    # Prefer a direct Toman market whenever it exists. A normal BFS can
+    # otherwise take an earlier-listed BTC/ETH route before checking a direct
+    # asset/TMN market, producing a less reliable valuation.
+    direct = [
+        rate for next_asset, rate in graph.get(asset, [])
+        if next_asset == "TMN" and rate > 0
+    ]
+    if direct:
+        return direct[0]
+
+    # For indirect conversion, use the shortest route and give stablecoin
+    # markets deterministic priority over volatile bridge assets.
+    bridge_priority = {"USDT": 0, "USDC": 1, "TMN": -1, "BTC": 2, "ETH": 3}
     queue = [(asset, Decimal("1"))]
     visited = {asset}
     while queue:
         current, rate = queue.pop(0)
-        if current == "TMN":
-            return rate
-        for next_asset, edge_rate in graph.get(current, []):
+        edges = sorted(
+            graph.get(current, []),
+            key=lambda edge: (bridge_priority.get(edge[0], 4), edge[0]),
+        )
+        for next_asset, edge_rate in edges:
+            if next_asset == "TMN":
+                return rate * edge_rate
             if next_asset not in visited:
                 visited.add(next_asset)
                 queue.append((next_asset, rate * edge_rate))
@@ -6115,6 +6228,7 @@ async def send_html_widget(message, html, context):
         raise RuntimeError("ساخت کد کوتاه یکتا ممکن نشد، دوباره تلاش کن.")
     archived = await context.bot.send_document(
         chat_id=ACCESS_CHANNEL_ID,
+        message_thread_id=(bot_data.get("storage_topics") or {}).get("آرشیو ویجت ها"),
         document=InputFile(
             io.BytesIO(html.encode("utf-8")),
             filename=f"widget-{token}.html",
@@ -6312,9 +6426,8 @@ app = (
 )
 app.bot_data["source_texts"] = {}
 app.bot_data["authorized_users"] = set()
-# Group -2 records interaction metadata before access checks and handlers.
-app.add_handler(MessageHandler(filters.ALL, audit_log), group=-2)
-app.add_handler(CallbackQueryHandler(audit_log), group=-2)
+# Activity auditing is intentionally disabled. No user messages or button clicks
+# are copied into the support/storage group.
 # Group -1 checks every update before the bot's normal handlers.
 app.add_handler(MessageHandler(filters.ALL, access_guard), group=-1)
 app.add_handler(TypeHandler(Update, widget_query_handler), group=-3)
