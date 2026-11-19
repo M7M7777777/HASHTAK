@@ -213,7 +213,7 @@ def validate_storage_payload(data):
             raise ValueError("تنظیمات هوش مصنوعی معتبر نیست")
         if not isinstance(data["ai_config"].get("services"), dict):
             raise ValueError("فهرست سرویس های هوش مصنوعی معتبر نیست")
-    for key in ("widget_index_file_id", "runtime_snapshot_file_id", "users_file_id", "ai_config_file_id"):
+    for key in ("widget_index_file_id", "runtime_snapshot_file_id", "users_file_id", "ai_config_file_id", "runtime_snapshot_sha256"):
         if data.get(key) is not None and not isinstance(data.get(key), str):
             raise ValueError(f"شناسه فایل ذخیره سازی {key} معتبر نیست")
     if "topics" in data and not isinstance(data.get("topics"), dict):
@@ -240,6 +240,7 @@ def storage_message_text(context, users=None, ai_config=None):
         "ai_config_file_id": bot_data.get("ai_config_file_id"),
         "widget_index_file_id": bot_data.get("widget_index_file_id"),
         "runtime_snapshot_file_id": bot_data.get("runtime_snapshot_file_id"),
+        "runtime_snapshot_sha256": bot_data.get("runtime_snapshot_sha256"),
         "topics": bot_data.get("storage_topics", {}),
     }
     return plain_storage_text(data)
@@ -380,6 +381,7 @@ async def restore_runtime_state(application, file_id):
     remote = await application.bot.get_file(file_id)
     raw = bytes(await remote.download_as_bytearray())
     snapshot = json.loads(raw.decode("utf-8"))
+    application.bot_data["runtime_snapshot_sha256"] = hashlib.sha256(raw).hexdigest()
     if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
         raise ValueError("ساختار نسخه پشتیبان تلگرام معتبر نیست")
     sources = snapshot.get("sources", {})
@@ -408,12 +410,14 @@ async def persist_runtime_state(application):
     async with lock:
         snapshot = {
             "version": 1,
-            "saved_at": datetime.now(timezone.utc).isoformat(),
             "sources": bot_data.get("source_texts", {}),
             "topic_loop_states": bot_data.get("topic_loop_states", {}),
             "user_data": {str(user_id): data for user_id, data in application.user_data.items()},
         }
         raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        snapshot_hash = hashlib.sha256(raw).hexdigest()
+        if snapshot_hash == bot_data.get("runtime_snapshot_sha256"):
+            return
         thread_id = (bot_data.get("storage_topics") or {}).get("پشتیبان")
         archived = await application.bot.send_document(
             chat_id=ACCESS_CHANNEL_ID,
@@ -423,12 +427,15 @@ async def persist_runtime_state(application):
             disable_notification=True,
         )
         previous_id = bot_data.get("runtime_snapshot_file_id")
+        previous_hash = bot_data.get("runtime_snapshot_sha256")
         bot_data["runtime_snapshot_file_id"] = archived.document.file_id
+        bot_data["runtime_snapshot_sha256"] = snapshot_hash
         try:
             context = type("StorageContext", (), {"application": application, "bot": application.bot})()
             await persist_storage(context)
         except Exception:
             bot_data["runtime_snapshot_file_id"] = previous_id
+            bot_data["runtime_snapshot_sha256"] = previous_hash
             raise
 
 
