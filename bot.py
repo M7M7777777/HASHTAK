@@ -871,6 +871,27 @@ async def initialize_access_storage(application):
         application.bot_data["ai_config"] = ai_config
 
         await ensure_storage_topics(application, saved_topics)
+        settings_thread_id = application.bot_data["storage_topics"]["تنظیمات"]
+
+        # Older versions pinned the storage index in General. Move that bot-owned
+        # record into the Settings topic so General stays free of bot storage.
+        if (
+            pinned
+            and application.bot_data.get("storage_message_id")
+            and getattr(pinned, "message_thread_id", None) != settings_thread_id
+        ):
+            try:
+                await application.bot.delete_message(
+                    chat_id=ACCESS_CHANNEL_ID,
+                    message_id=pinned.message_id,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    "پیام ذخیره سازی قدیمی هنوز در General است و حذف آن ممکن نشد؛ "
+                    "برای جلوگیری از ادامه ذخیره سازی در General راه اندازی متوقف شد"
+                ) from error
+            application.bot_data.pop("storage_message_id", None)
+
         payload = {
             "users_file_id": users_file_id,
             "ai_config_file_id": ai_config_file_id,
@@ -879,10 +900,13 @@ async def initialize_access_storage(application):
             "runtime_snapshot_sha256": runtime_snapshot_sha256,
             "topics": application.bot_data["storage_topics"],
         }
-        if not application.bot_data.get("storage_message_id"):
+        desired_text = plain_storage_text(payload)
+        storage_message_id = application.bot_data.get("storage_message_id")
+        if not storage_message_id:
             message = await application.bot.send_message(
                 chat_id=ACCESS_CHANNEL_ID,
-                text=plain_storage_text(payload),
+                message_thread_id=settings_thread_id,
+                text=desired_text,
                 disable_notification=True,
             )
             await application.bot.pin_chat_message(
@@ -891,15 +915,13 @@ async def initialize_access_storage(application):
                 disable_notification=True,
             )
             application.bot_data["storage_message_id"] = message.message_id
-        else:
-            desired_text = plain_storage_text(payload)
-            if pinned_text != desired_text:
-                await safe_edit_message_text(
-                    application.bot,
-                    chat_id=ACCESS_CHANNEL_ID,
-                    message_id=application.bot_data["storage_message_id"],
-                    text=desired_text,
-                )
+        elif pinned_text != desired_text:
+            await safe_edit_message_text(
+                application.bot,
+                chat_id=ACCESS_CHANNEL_ID,
+                message_id=storage_message_id,
+                text=desired_text,
+            )
 
         application.bot_data["access_message_id"] = application.bot_data["storage_message_id"]
         application.bot_data["access_channel_ready"] = True
