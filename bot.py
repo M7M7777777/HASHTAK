@@ -25,6 +25,7 @@ from decimal import Decimal, InvalidOperation
 
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, filters
+from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -5915,7 +5916,31 @@ async def widget_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await receive_media(update, context)
 
-app = Application.builder().token(TOKEN).post_init(initialize_access_storage).build()
+# Telegram storage operations include multi-file uploads. PTB's default HTTPX
+# timeouts are too short for these requests on slower Railway/network links.
+telegram_request = HTTPXRequest(
+    connection_pool_size=32,
+    connect_timeout=20.0,
+    read_timeout=60.0,
+    write_timeout=120.0,
+    pool_timeout=30.0,
+    media_write_timeout=180.0,
+)
+telegram_updates_request = HTTPXRequest(
+    connection_pool_size=8,
+    connect_timeout=20.0,
+    read_timeout=60.0,
+    write_timeout=30.0,
+    pool_timeout=30.0,
+)
+app = (
+    Application.builder()
+    .token(TOKEN)
+    .request(telegram_request)
+    .get_updates_request(telegram_updates_request)
+    .post_init(initialize_access_storage)
+    .build()
+)
 app.bot_data["source_texts"] = {}
 app.bot_data["authorized_users"] = set()
 # Group -2 records interaction metadata before access checks and handlers.
