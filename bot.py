@@ -401,7 +401,7 @@ async def persist_runtime_state(application):
 
 async def runtime_snapshot_worker(application):
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(300)
         try:
             await persist_runtime_state(application)
         except asyncio.CancelledError:
@@ -593,6 +593,8 @@ async def create_numbered_topic(application, chat_id):
     )
     state["next_number"] = number + 1
     save_topic_loop_states(states)
+    if chat_id == ACCESS_CHANNEL_ID:
+        await persist_runtime_state(application)
 
 
 async def topic_loop_worker(application, chat_id):
@@ -614,7 +616,7 @@ async def topic_loop_worker(application, chat_id):
 
 async def resume_topic_loops(application):
     try:
-        states = load_topic_loop_states()
+        states = application.bot_data.get("topic_loop_states") or load_topic_loop_states()
     except Exception as error:
         print(
             f"WARNING: topic loop state could not be loaded: {type(error).__name__}: {error}",
