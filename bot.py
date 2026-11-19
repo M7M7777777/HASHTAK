@@ -26,11 +26,11 @@ from decimal import Decimal, InvalidOperation
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, filters
 from telegram.request import HTTPXRequest
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "01"
+VERSION = "02"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -485,6 +485,19 @@ async def sync_readable_storage_topics(context):
                 flush=True,
             )
 
+def is_message_not_modified_error(error):
+    return isinstance(error, BadRequest) and "message is not modified" in str(error).lower()
+
+
+async def safe_edit_message_text(bot, **kwargs):
+    try:
+        return await telegram_storage_call(bot.edit_message_text, **kwargs)
+    except BadRequest as error:
+        if not is_message_not_modified_error(error):
+            raise
+        return None
+
+
 async def persist_storage(context, users=None, ai_config=None):
     bot_data = context.application.bot_data
     lock = bot_data.setdefault("storage_lock", asyncio.Lock())
@@ -503,7 +516,12 @@ async def persist_storage(context, users=None, ai_config=None):
                 bot_data["ai_config"] = ai_config
             await sync_readable_storage_topics(context)
             text = storage_message_text(context, users, ai_config)
-            await telegram_storage_call(context.bot.edit_message_text, chat_id=ACCESS_CHANNEL_ID, message_id=message_id, text=text)
+            await safe_edit_message_text(
+                context.bot,
+                chat_id=ACCESS_CHANNEL_ID,
+                message_id=message_id,
+                text=text,
+            )
         except Exception:
             bot_data["users_file_id"] = previous_users_file_id
             bot_data["ai_config_file_id"] = previous_ai_file_id
@@ -515,8 +533,16 @@ async def persist_storage(context, users=None, ai_config=None):
 
 
 async def persist_ai_config(config, context):
-    await persist_storage(context, ai_config=config)
-    await persist_runtime_state(context.application)
+    bot_data = context.application.bot_data
+    previous_ai_config = copy.deepcopy(bot_data.get("ai_config"))
+    bot_data["ai_config"] = config
+    try:
+        await persist_runtime_state(context.application)
+        await persist_storage(context, ai_config=config)
+    except Exception:
+        if previous_ai_config is not None:
+            bot_data["ai_config"] = previous_ai_config
+        raise
 
 def empty_widget_index():
     return {"version": 1, "widgets": {}, "messages": {}}
@@ -868,7 +894,8 @@ async def initialize_access_storage(application):
         else:
             desired_text = plain_storage_text(payload)
             if pinned_text != desired_text:
-                await application.bot.edit_message_text(
+                await safe_edit_message_text(
+                    application.bot,
                     chat_id=ACCESS_CHANNEL_ID,
                     message_id=application.bot_data["storage_message_id"],
                     text=desired_text,
@@ -1067,7 +1094,13 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception:
                 state["active"] = False
                 save_topic_loop_states(states)
-                await persist_runtime_state(context.application)
+                try:
+                    await persist_runtime_state(context.application)
+                except Exception as rollback_error:
+                    print(
+                        f"TOPIC LOOP ROLLBACK PERSIST FAILED: {type(rollback_error).__name__}: {rollback_error}",
+                        flush=True,
+                    )
                 raise
             task = context.application.create_task(
                 topic_loop_worker(context.application, chat.id),
@@ -1402,8 +1435,8 @@ async def persist_access_users(users, context):
         detail = f"\nعلت اولیه: {startup_error}" if startup_error else ""
         raise RuntimeError("ذخیره سازی کانال آماده نیست؛ اطلاعات قبلی دست نخورده باقی ماند." + detail)
     try:
-        await persist_storage(context, users=users)
         await persist_runtime_state(context.application)
+        await persist_storage(context, users=users)
         save_access_users(users)
     except Exception as error:
         print(f"PERSISTENT STORAGE UPDATE FAILED: {type(error).__name__}: {error}", flush=True)
@@ -6306,6 +6339,18 @@ app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*(?:شرووع(
 app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*م\s*$"), widget_menu_start), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, widget_text), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text), group=1)
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if is_message_not_modified_error(err):
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        print(f"TELEGRAM TRANSIENT NETWORK ERROR: {type(err).__name__}: {err}", flush=True)
+        return
+    print(f"UNHANDLED BOT ERROR: {type(err).__name__}: {err}", flush=True)
+
+
+app.add_error_handler(global_error_handler)
 
 if __name__ == "__main__":
     allowed_updates = list(Update.ALL_TYPES) + ["widget_query", "shared_widget_query"]
