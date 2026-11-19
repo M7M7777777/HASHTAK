@@ -31,7 +31,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "06"
+VERSION = "07"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -505,7 +505,7 @@ def _rich_storage_digest(payload):
 
 
 def encode_rich_storage_payload(payload):
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    raw = repr(payload).encode("utf-8")
     compressed = zlib.compress(raw, 9)
     encryption_key, authentication_key = ai_keys()
     nonce = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-NONCE" + compressed, hashlib.sha256).digest()[:16]
@@ -525,7 +525,7 @@ def decode_rich_storage_payload(encoded):
     expected_tag = hmac.new(authentication_key, b"HASHTAK-RICH-STORAGE-V1" + nonce + ciphertext, hashlib.sha256).digest()
     if not hmac.compare_digest(supplied_tag, expected_tag):
         raise ValueError("اعتبارسنجی داده پشتیبان Rich Message ناموفق بود")
-    payload = json.loads(zlib.decompress(ai_xor_stream(ciphertext, encryption_key, nonce)).decode("utf-8"))
+    payload = ast.literal_eval(zlib.decompress(ai_xor_stream(ciphertext, encryption_key, nonce)).decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("version") != 1:
         raise ValueError("نسخه داده پشتیبان Rich Message معتبر نیست")
     return payload
@@ -624,6 +624,7 @@ async def persist_storage(context, users=None, ai_config=None):
                 "rich_message": rich_message,
             })
             bot_data["rich_storage_sha256"] = digest
+            print("Telegram Rich Message storage updated", flush=True)
         except Exception:
             bot_data["users_file_id"] = previous_users_file_id
             bot_data["ai_config_file_id"] = previous_ai_file_id
