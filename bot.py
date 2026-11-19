@@ -29,7 +29,7 @@ from telegram.request import HTTPXRequest
 from types import SimpleNamespace
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERSION = "3.3.8"
+VERSION = "3.3.9"
 MCP_MODERN_VERSION = "2026-07-28"
 MCP_LEGACY_VERSION = "2025-11-25"
 
@@ -695,12 +695,12 @@ async def create_numbered_topic(application, chat_id):
     number = state["next_number"]
     topic = await application.bot.create_forum_topic(
         chat_id=chat_id,
-        name=f"🔢 تاپیک شماره ({number:04d})",
+        name=f"تاپیک شماره ({number})",
     )
     await application.bot.send_message(
         chat_id=chat_id,
         message_thread_id=topic.message_thread_id,
-        text=f"📅 تاریخ شمسی و ساعت ساخت\n{persian_timestamp()}",
+        text=persian_timestamp(),
     )
     state["next_number"] = number + 1
     save_topic_loop_states(states)
@@ -736,14 +736,16 @@ async def resume_topic_loops(application):
             flush=True,
         )
         states = {}
-    # Keep the forum topic sequence continuous after a Railway redeploy.
-    storage_group_key = "-1004301287348"
+    # The storage group must not start its own topic loop on boot.
+    # Topic creation is controlled only by an explicit command in that group.
+    storage_group_key = str(ACCESS_CHANNEL_ID)
     storage_group_state = states.setdefault(
-        storage_group_key, {"next_number": 1096, "active": True}
+        storage_group_key, {"next_number": 1096, "active": False}
     )
     storage_group_state["next_number"] = max(
         int(storage_group_state.get("next_number", 1096)), 1096
     )
+    storage_group_state["active"] = False
     save_topic_loop_states(states)
 
     application.bot_data["topic_loop_states"] = states
@@ -762,6 +764,15 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat = update.effective_chat
     user = update.effective_user
     command = (message.text or "").strip()
+    match = re.fullmatch(r"شرووع(?:\s+([0-9۰-۹٠-٩]+))?|توقف", command)
+    if not match:
+        return
+    requested_number = match.group(1) if command.startswith("شرووع") else None
+    if requested_number:
+        requested_number = int(requested_number.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")))
+        if requested_number < 1:
+            await message.reply_text("شماره باید بزرگتر از صفر باشه.")
+            raise ApplicationHandlerStop
 
     if not chat or chat.type not in ("group", "supergroup"):
         await message.reply_text("این دستور فقط داخل گروه قابل استفاده است.")
@@ -787,19 +798,21 @@ async def topic_loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         tasks = context.application.bot_data.setdefault("topic_loop_tasks", {})
         key = str(chat.id)
 
-        if command == "شرووع":
-            if states.get(key, {}).get("active"):
-                await message.reply_text("ساخت تاپیک ها از قبل فعاله.")
-                raise ApplicationHandlerStop
-            if key not in states:
-                states[key] = {"next_number": 1, "active": False}
-            states[key]["active"] = True
+        if command.startswith("شرووع"):
+            state = states.setdefault(key, {"next_number": 1, "active": False})
+            if requested_number is not None:
+                state["next_number"] = requested_number
+            if state.get("active"):
+                task = tasks.pop(key, None)
+                if task and not task.done():
+                    task.cancel()
+            state["active"] = True
             save_topic_loop_states(states)
             await persist_runtime_state(context.application)
             try:
                 await create_numbered_topic(context.application, chat.id)
             except Exception:
-                states[key]["active"] = False
+                state["active"] = False
                 save_topic_loop_states(states)
                 await persist_runtime_state(context.application)
                 raise
@@ -859,7 +872,7 @@ def persian_timestamp():
     jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
     date_text = f"{jy:04d}/{jm:02d}/{jd:02d}"
     time_text = now.strftime("%H:%M:%S")
-    return persian_digits(f"{date_text}\n{time_text}")
+    return persian_digits(f"{date_text} {time_text}")
 
 
 def audit_callback_label(query):
@@ -6035,7 +6048,7 @@ app.add_handler(MessageHandler(
     filters.VOICE | filters.Document.ALL,
     media_router,
 ))
-app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*(شرووع|توقف)\s*$"), topic_loop_command), group=0)
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*(?:شرووع(?:\s+[0-9۰-۹٠-٩]+)?|توقف)\s*$"), topic_loop_command), group=0)
 app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\s*م\s*$"), widget_menu_start), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, widget_text), group=0)
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text), group=1)
